@@ -40,10 +40,23 @@ def fail(msg: str) -> None:
 
 
 def find_material(stage, name):
+    """Locate a material by its original Blender name.
+
+    USD identifier sanitization rewrites ``creature-eyes`` to ``creature_eyes``
+    on the prim, so matching on prim name alone misses these. The original
+    Blender name is preserved on ``userProperties:blender:data_name``; match
+    that first and fall back to prim name for safety.
+    """
+    fallback = None
     for prim in stage.Traverse():
-        if prim.IsA(UsdShade.Material) and prim.GetName() == name:
+        if not prim.IsA(UsdShade.Material):
+            continue
+        data_name_attr = prim.GetAttribute("userProperties:blender:data_name")
+        if data_name_attr and data_name_attr.Get() == name:
             return UsdShade.Material(prim)
-    return None
+        if prim.GetName() == name:
+            fallback = UsdShade.Material(prim)
+    return fallback
 
 
 def find_preview_surface_shader(material):
