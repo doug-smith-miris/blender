@@ -157,6 +157,38 @@ static void sh_node_mix_rgb_build_multi_function(NodeMultiFunctionBuilder &build
   builder.construct_and_set_matching_fn<MixRGBFunction>(clamp, mix_type);
 }
 
+NODE_SHADER_MATERIALX_BEGIN
+#ifdef WITH_MATERIALX
+{
+  /* Only MA_RAMP_BLEND (the default linear "Mix" blend) maps cleanly to MaterialX's
+   * <mix> standard node. Other blend modes (Add, Multiply, Screen, Overlay, Hue/Sat/Val,
+   * Soft/Linear light, Burn/Dodge, Color, Difference, Exclusion, Dark, Light) require
+   * compound MaterialX networks that aren't covered by this bite — those fall through and
+   * the writer will emit a warning. See translation-mapping.md. */
+  if (node_->custom1 != MA_RAMP_BLEND) {
+    CLOG_WARN(LOG_IO_MATERIALX,
+              "ShaderNodeMixRGB (Legacy) blend mode %d is not yet supported for MaterialX "
+              "export; emitting linear mix as a best-effort approximation",
+              node_->custom1);
+  }
+
+  NodeItem fac = get_input_value("Fac", NodeItem::Type::Float);
+  NodeItem color1 = get_input_value("Color1", NodeItem::Type::Color3);
+  NodeItem color2 = get_input_value("Color2", NodeItem::Type::Color3);
+
+  /* The legacy node clamps Fac to [0,1] unconditionally in its GPU path. */
+  fac = fac.clamp();
+
+  NodeItem result = fac.mix(color1, color2);
+
+  if (node_->custom2 & SHD_MIXRGB_CLAMP) {
+    result = result.clamp();
+  }
+  return result;
+}
+#endif
+NODE_SHADER_MATERIALX_END
+
 }  // namespace nodes::node_shader_mix_rgb_cc
 
 void register_node_type_sh_mix_rgb()
@@ -173,6 +205,7 @@ void register_node_type_sh_mix_rgb()
   ntype.declare = file_ns::sh_node_mix_rgb_declare;
   ntype.labelfunc = node_blend_label;
   ntype.gpu_fn = file_ns::gpu_shader_mix_rgb;
+  ntype.materialx_fn = file_ns::node_shader_materialx;
   ntype.build_multi_function = file_ns::sh_node_mix_rgb_build_multi_function;
   ntype.gather_link_search_ops = nullptr;
   bke::node_register_type(ntype);
