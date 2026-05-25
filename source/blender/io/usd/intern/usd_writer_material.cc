@@ -29,6 +29,7 @@
 #include "BLI_string.h"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utils.hh"
+#include "BLI_vector.hh"
 
 #include "DNA_material_types.h"
 #include "DNA_node_types.h"
@@ -1062,8 +1063,16 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
 
 /* Search the upstream node links connected to the given socket and return the first occurrence
  * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null. */
-static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
+ * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null.
+ *
+ * Crosses ShaderNodeGroup boundaries transparently: when the upstream node is a group,
+ * the traversal descends through the matching NodeGroupOutput socket; when it hits a
+ * NodeGroupInput inside a group, it ascends back out via the parent group node's matching
+ * input socket. `group_stack` tracks the chain of parent group nodes that have been entered
+ * so the ascent goes back to the right place. */
+static bNodeLink *traverse_channel(bNodeSocket *input,
+                                   const short target_type,
+                                   Vector<bNode *> &group_stack)
 {
   if (!(input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
@@ -1075,9 +1084,48 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
     return input->link;
   }
 
+  /* Descend into a ShaderNodeGroup: bridge from the parent's output socket through to
+   * the corresponding NodeGroupOutput input socket inside the embedded node tree. */
+  if (linked_node->type_legacy == NODE_GROUP && linked_node->id) {
+    bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(linked_node->id);
+    group_tree->ensure_topology_cache();
+    bNode *group_out = group_tree->group_output_node();
+    if (!group_out) {
+      return nullptr;
+    }
+    const StringRef socket_id = input->link->fromsock->identifier;
+    for (bNodeSocket *sock : group_out->input_sockets()) {
+      if (socket_id == sock->identifier) {
+        group_stack.append(linked_node);
+        bNodeLink *result = traverse_channel(sock, target_type, group_stack);
+        group_stack.pop_last();
+        return result;
+      }
+    }
+    return nullptr;
+  }
+
+  /* Ascend out of a ShaderNodeGroup: a NodeGroupInput is a proxy for the parent group
+   * node's inputs. Map fromsock's identifier back to the parent group node's input
+   * socket and continue traversal there. Without a known parent (empty stack) the group
+   * is being inspected standalone — fall through to the generic DFS. */
+  if (linked_node->type_legacy == NODE_GROUP_INPUT && !group_stack.is_empty()) {
+    bNode *parent_group = group_stack.last();
+    const StringRef socket_id = input->link->fromsock->identifier;
+    for (bNodeSocket *sock : parent_group->input_sockets()) {
+      if (socket_id == sock->identifier) {
+        bNode *popped = group_stack.pop_last();
+        bNodeLink *result = traverse_channel(sock, target_type, group_stack);
+        group_stack.append(popped);
+        return result;
+      }
+    }
+    return nullptr;
+  }
+
   /* Recursively traverse the linked node's sockets. */
   for (bNodeSocket &sock : linked_node->inputs) {
-    if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
+    if (bNodeLink *found_link = traverse_channel(&sock, target_type, group_stack)) {
       return found_link;
     }
   }
@@ -1085,17 +1133,43 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree.  Returns null if no instance of either type was found. */
-static bNode *find_bsdf_node(Material *material)
+static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
 {
-  for (bNode *node : material->nodetree->all_nodes()) {
+  Vector<bNode *> group_stack;
+  return traverse_channel(input, target_type, group_stack);
+}
+
+/* Recursive helper used by find_bsdf_node: search ntree for a Principled or Diffuse BSDF,
+ * descending into nested ShaderNodeGroups so groups that wrap the BSDF are still found. */
+static bNode *find_bsdf_node_in_tree(bNodeTree *ntree)
+{
+  if (!ntree) {
+    return nullptr;
+  }
+  ntree->ensure_topology_cache();
+  for (bNode *node : ntree->all_nodes()) {
     if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
       return node;
     }
+    if (node->type_legacy == NODE_GROUP && node->id) {
+      bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(node->id);
+      if (bNode *found = find_bsdf_node_in_tree(group_tree)) {
+        return found;
+      }
+    }
   }
-
   return nullptr;
+}
+
+/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
+ * material's node tree, descending into any nested ShaderNodeGroups. Returns null if no
+ * instance of either type was found. */
+static bNode *find_bsdf_node(Material *material)
+{
+  if (!material || !material->nodetree) {
+    return nullptr;
+  }
+  return find_bsdf_node_in_tree(material->nodetree);
 }
 
 /**
