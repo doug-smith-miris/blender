@@ -18,6 +18,8 @@
 #include "BKE_node_runtime.hh"
 #include "BKE_report.hh"
 
+#include "NOD_shader.h"
+
 #include "IMB_colormanagement.hh"
 #include "IMB_imbuf.hh"
 
@@ -1060,12 +1062,73 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
   return wrap;
 }
 
-/* Search the upstream node links connected to the given socket and return the first occurrence
- * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null. */
+/* Returns true if `sock_name` (the Blender display name of an input socket)
+ * is one of the signal-carrying inputs we are willing to descend into when
+ * walking upstream from `linked_node` looking for `target_type`. */
+static bool is_signal_carrying_input(const bNode *linked_node, const char *sock_name)
+{
+  if (!linked_node || !sock_name) {
+    return false;
+  }
+  switch (linked_node->type_legacy) {
+    /* Reroute has a single (unnamed) input that always carries the signal. */
+    case NODE_REROUTE:
+      return true;
+    /* Texture-on-color chains: the Color input carries the upstream image. */
+    case SH_NODE_NORMAL_MAP:
+    case SH_NODE_SEPARATE_COLOR:
+      return STREQ(sock_name, "Color");
+    /* Bump / Displacement: the Height input carries the upstream texture. */
+    case SH_NODE_BUMP:
+    case SH_NODE_DISPLACEMENT:
+      return STREQ(sock_name, "Height");
+    /* Combine Color: pass through the per-channel inputs in RGB mode. */
+    case SH_NODE_COMBINE_COLOR:
+      return STREQ(sock_name, "Red") || STREQ(sock_name, "Green") || STREQ(sock_name, "Blue");
+    /* Mapping: only the Vector input carries the upstream UV/coord source. */
+    case SH_NODE_MAPPING:
+      return STREQ(sock_name, "Vector");
+    /* Math: the two Value operands carry the upstream value. */
+    case SH_NODE_MATH:
+      return STREQ(sock_name, "Value");
+    /* Vector Math: the two Vector operands carry the upstream vector. */
+    case SH_NODE_VECTOR_MATH:
+      return STREQ(sock_name, "Vector");
+    default:
+      /* Color-modifying or value-modulating intermediates we cannot represent
+       * losslessly in UsdPreviewSurface (RGB Curves, Hue/Saturation, Float
+       * Curve, Color Ramp, Mix, Map Range, Clamp, Gamma, Brightness/Contrast,
+       * Invert, ...) and unknown node types: refuse to descend. Walking
+       * through them would silently flatten the artist's intent — and worse,
+       * a deep DFS through unrelated control inputs (Hue, Saturation, Factor,
+       * Map-Range From/To-Min/Max, ColorRamp Fac) can latch onto an Image
+       * Texture from a totally different channel and attach it as the source
+       * for this input. See BL-MAT-traverse-channel-naive-dfs-wrong-input-
+       * wiring. */
+      return false;
+  }
+}
+
+/* Walks upstream from the given input socket and returns the first link
+ * whose fromnode is of `target_type`. Returns null if no such terminal can
+ * be reached following only signal-carrying inputs (see
+ * `is_signal_carrying_input`). The returned link's `fromnode` and `fromsock`
+ * are guaranteed non-null.
+ *
+ * Implementation note (BL-MAT-traverse-channel-naive-dfs-wrong-input-wiring):
+ * the prior implementation did a naive DFS through *every* input of every
+ * intermediate node, including modulator and control inputs of color-
+ * modifying nodes. That caused the BSDF's Base Color traversal to find and
+ * attach an Image Texture wired into a completely unrelated control channel
+ * (e.g. a Hue/Saturation Hue operand, a Mix Factor driven by Map Range, a
+ * ColorRamp Fac). The exported UsdPreviewSurface ended up with diffuseColor
+ * pointing at the roughness texture, normal pointing at the diffuse texture,
+ * and so on. This version restricts the descent to nodes whose signal-flow
+ * we can identify, and halts at color-modifying intermediates rather than
+ * misattributing the deeper image. */
 static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
 {
-  if (!(input->link && input->link->fromnode && input->link->fromsock)) {
+  if (!(input && input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
   }
 
@@ -1075,8 +1138,11 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
     return input->link;
   }
 
-  /* Recursively traverse the linked node's sockets. */
+  /* Recursively traverse only the signal-carrying inputs of the linked node. */
   for (bNodeSocket &sock : linked_node->inputs) {
+    if (!is_signal_carrying_input(linked_node, sock.name)) {
+      continue;
+    }
     if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
       return found_link;
     }
@@ -1085,10 +1151,96 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree.  Returns null if no instance of either type was found. */
+/* Forward decl: find_connected_bsdf and find_bsdf_via_group_output recurse mutually. */
+static bNode *find_connected_bsdf(const bNodeSocket *socket);
+
+/* When upstream traversal reaches a ShaderNodeGroup, descend into the group's
+ * inner node tree and continue walking from the matching NodeGroupOutput input
+ * socket. Returns null if the group is broken, has no active NodeGroupOutput,
+ * or has no matching internal socket.
+ *
+ * Why this matters (BL-MAT-shadernodegroup-output-empty-prim): artists
+ * routinely wrap shader networks in a node group and only expose a single
+ * Surface output. The Principled BSDF then lives inside the group, not in the
+ * material's top-level node tree. Before this descent, `find_connected_bsdf`
+ * stopped at the group boundary (since its `inputs` are the external interface,
+ * not the inner graph), and the legacy `all_nodes()` fallback only scans the
+ * top-level tree — so `find_bsdf_node` returned null and the exporter emitted
+ * an empty `def Material "name" {}` with zero Shader descendants. */
+static bNode *find_bsdf_via_group_output(const bNode *group_node,
+                                         const bNodeSocket *external_out)
+{
+  if (!group_node || !external_out) {
+    return nullptr;
+  }
+  bNodeTree *inner = reinterpret_cast<bNodeTree *>(group_node->id);
+  if (!inner) {
+    return nullptr;
+  }
+  inner->ensure_topology_cache();
+  const bNode *group_output_node = inner->group_output_node();
+  if (!group_output_node) {
+    return nullptr;
+  }
+  /* External outputs on a Group node and the internal NodeGroupOutput's input
+   * sockets share identifiers across the interface — match by identifier so we
+   * are robust to virtual extension sockets and reordering. */
+  for (const bNodeSocket &internal_in : group_output_node->inputs) {
+    if (STREQ(internal_in.identifier, external_out->identifier)) {
+      return find_connected_bsdf(&internal_in);
+    }
+  }
+  return nullptr;
+}
+
+/* Walk upstream from the given socket through pass-through nodes (reroutes, Mix Shader,
+ * Add Shader, etc.) and return the first connected Principled/Diffuse BSDF, or null.
+ * Descends into ShaderNodeGroup nodes via find_bsdf_via_group_output. */
+static bNode *find_connected_bsdf(const bNodeSocket *socket)
+{
+  if (!socket || !socket->link || !socket->link->fromnode) {
+    return nullptr;
+  }
+  bNode *from = socket->link->fromnode;
+  if (ELEM(from->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
+    return from;
+  }
+  if (from->is_group()) {
+    /* The external `inputs` of a group node are values flowing IN, not the
+     * graph that produced the upstream output we are tracing — so do NOT fall
+     * through to the generic input-iteration after descending. */
+    return find_bsdf_via_group_output(from, socket->link->fromsock);
+  }
+  for (const bNodeSocket &sock : from->inputs) {
+    if (bNode *found = find_connected_bsdf(&sock)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+/* Returns the Principled or Diffuse BSDF that is actually connected to the active
+ * Material Output's Surface socket. Falls back to the legacy first-match scan when no
+ * connected BSDF can be found (e.g. when the chain enters a Group node — that is
+ * BL-MAT-NG-001's territory, handled by a separate bite).
+ *
+ * Why this matters: artists frequently leave disconnected "ghost" Principled BSDF nodes
+ * in the graph (leftover from material iteration). The previous implementation grabbed
+ * the first one it saw in `all_nodes()` — even if the Surface output was actually wired
+ * to a different shader entirely. That misattributed the wrong defaults onto the exported
+ * UsdPreviewSurface. */
 static bNode *find_bsdf_node(Material *material)
 {
+  if (bNodeTree *ntree = material->nodetree) {
+    if (bNode *output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_ALL)) {
+      if (bNodeSocket *surface = bke::node_find_socket(*output, SOCK_IN, "Surface"_ustr)) {
+        if (bNode *bsdf = find_connected_bsdf(surface)) {
+          return bsdf;
+        }
+      }
+    }
+  }
+
   for (bNode *node : material->nodetree->all_nodes()) {
     if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
       return node;
