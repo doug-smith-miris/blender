@@ -44,6 +44,7 @@ class USDGenericMeshWriter : public USDAbstractWriter {
                     const SubsurfModifierData *subsurfData);
   void get_geometry_data(const Mesh *mesh, struct USDMeshData &usd_mesh_data);
   void assign_materials(const HierarchyContext &context,
+                        const Mesh *mesh,
                         const pxr::UsdGeomMesh &usd_mesh,
                         const MaterialFaceGroups &usd_face_groups);
   void write_normals(const Mesh *mesh, pxr::UsdGeomMesh &usd_mesh);

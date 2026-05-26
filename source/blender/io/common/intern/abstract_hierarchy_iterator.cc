@@ -14,6 +14,7 @@
 #include "BKE_geometry_set_instances.hh"
 #include "BKE_key.hh"
 #include "BKE_object.hh"
+#include "BKE_object_types.hh"
 #include "BKE_particle.h"
 
 #include "BLI_assert.h"
@@ -422,6 +423,8 @@ void AbstractHierarchyIterator::export_graph_clear()
   }
   export_graph_.clear();
   used_names_.clear_and_keep_capacity();
+  dupli_shallow_objects_.clear();
+  dupli_shallow_runtimes_.clear();
 }
 
 void AbstractHierarchyIterator::visit_object(Object *object,
@@ -469,6 +472,24 @@ void AbstractHierarchyIterator::visit_dupli_object(const DupliObject *dupli_obje
 {
   HierarchyContext *context = new HierarchyContext();
   context->object = dupli_object->ob;
+
+  /* Geometry Nodes can realize per-instance geometry whose data type differs from
+   * `ob->data` (e.g. a Curves object whose GN modifier outputs brushstroke meshes).
+   * The depsgraph signals this by populating `DupliObject::ob_data` with the realized
+   * data ID. Without this override the wrong writer is dispatched (curves writer for
+   * a mesh, etc.) and the realized geometry plus its material bindings are dropped.
+   * Build a shallow-copy Object whose `type`/`data`/`runtime->data_eval` reflect the
+   * realized data so downstream writers see the correct geometry. */
+  if (dupli_object->ob_data != nullptr && dupli_object->ob->data != dupli_object->ob_data) {
+    auto shallow_runtime = std::make_unique<bke::ObjectRuntime>(*dupli_object->ob->runtime);
+    auto shallow_object = std::make_unique<Object>(dna::shallow_copy(*dupli_object->ob));
+    shallow_object->runtime = shallow_runtime.get();
+    BKE_object_replace_data_on_shallow_copy(shallow_object.get(), dupli_object->ob_data);
+    context->object = shallow_object.get();
+    dupli_shallow_objects_.append(std::move(shallow_object));
+    dupli_shallow_runtimes_.append(std::move(shallow_runtime));
+  }
+
   context->is_object_data_context = false;
   context->duplicator = duplicator;
   context->persistent_id = PersistentID(dupli_object);
