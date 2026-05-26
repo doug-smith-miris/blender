@@ -29,6 +29,7 @@
 #include "BLI_string.h"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utils.hh"
+#include "BLI_vector.hh"
 
 #include "DNA_material_types.h"
 #include "DNA_node_types.h"
@@ -1062,8 +1063,16 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
 
 /* Search the upstream node links connected to the given socket and return the first occurrence
  * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null. */
-static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
+ * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null.
+ *
+ * The traversal crosses ShaderNodeGroup boundaries so that wrappers do not flatten Principled
+ * BSDF inputs (UDIM image textures, normal maps, etc.) to socket defaults. `group_stack` tracks
+ * the parent group nodes so a NodeGroupInput proxy inside a group can be mapped back to the
+ * driving socket on the parent group node.
+ */
+static bNodeLink *traverse_channel(bNodeSocket *input,
+                                   const short target_type,
+                                   Vector<bNode *> &group_stack)
 {
   if (!(input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
@@ -1075,14 +1084,56 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
     return input->link;
   }
 
+  /* Descend into a ShaderNodeGroup: continue traversal from the matching socket on the
+   * group's NodeGroupOutput. The fromsock identifier is the stable Blender socket id and
+   * matches between the group node's output and the GroupOutput's mirrored input. */
+  if (linked_node->type_legacy == NODE_GROUP && linked_node->id) {
+    bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(linked_node->id);
+    group_tree->ensure_topology_cache();
+    if (bNode *group_out = group_tree->group_output_node()) {
+      const StringRef fromsock_id = input->link->fromsock->identifier;
+      for (bNodeSocket *inner_sock : group_out->input_sockets()) {
+        if (fromsock_id == inner_sock->identifier) {
+          group_stack.append(linked_node);
+          bNodeLink *result = traverse_channel(inner_sock, target_type, group_stack);
+          group_stack.pop_last();
+          return result;
+        }
+      }
+    }
+    return nullptr;
+  }
+
+  /* Ascend out of a ShaderNodeGroup: a NodeGroupInput proxies the parent group node's inputs.
+   * Without a known parent the group is being inspected standalone — fall through. */
+  if (linked_node->type_legacy == NODE_GROUP_INPUT && !group_stack.is_empty()) {
+    bNode *parent_group = group_stack.last();
+    const StringRef fromsock_id = input->link->fromsock->identifier;
+    for (bNodeSocket *outer_sock : parent_group->input_sockets()) {
+      if (fromsock_id == outer_sock->identifier) {
+        bNode *popped = group_stack.pop_last();
+        bNodeLink *result = traverse_channel(outer_sock, target_type, group_stack);
+        group_stack.append(popped);
+        return result;
+      }
+    }
+    return nullptr;
+  }
+
   /* Recursively traverse the linked node's sockets. */
   for (bNodeSocket &sock : linked_node->inputs) {
-    if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
+    if (bNodeLink *found_link = traverse_channel(&sock, target_type, group_stack)) {
       return found_link;
     }
   }
 
   return nullptr;
+}
+
+static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
+{
+  Vector<bNode *> group_stack;
+  return traverse_channel(input, target_type, group_stack);
 }
 
 /* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
