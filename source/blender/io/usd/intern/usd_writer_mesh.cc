@@ -694,22 +694,16 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
     return;
   }
 
-<<<<<<< HEAD
-  /* Define a geometry subset per material. */
-  for (const MaterialFaceGroups::Item &face_group : usd_face_groups.items()) {
-    short material_number = face_group.key;
-    const pxr::VtIntArray &face_indices = face_group.value;
-
-    Material *material = get_material_for_slot(material_number);
-=======
-  /* Define one UsdGeomSubset of family `materialBind` per declared, non-empty material
-   * slot. Slots that have no faces using them on this mesh are still authored — with an
+  /* Define one UsdGeomSubset of family `materialBind` per declared material slot.
+   * Slots that have no faces using them on this mesh are still authored — with an
    * empty `indices` array — so the multi-slot structure of the source mesh round-trips
-   * through USD. See BL-MAT-007-multi-material-mesh-geomsubsets-missing. */
+   * through USD. See BL-MAT-007-multi-material-mesh-geomsubsets-missing. Iterating by
+   * slot number (rather than by populated face_groups entry) subsumes BL-GEO-001's
+   * `usd_face_groups.items()` loop — the same `usd_face_groups` map is consulted, we
+   * just look up by `mat_num` and fall back to `empty_indices` when no faces use that slot. */
   const pxr::VtIntArray empty_indices;
   for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
     Material *material = BKE_object_material_get(context.object, mat_num + 1);
->>>>>>> miris/bl-mat-007-multi-material-mesh-geomsubsets-missing
     if (material == nullptr) {
       continue;
     }
