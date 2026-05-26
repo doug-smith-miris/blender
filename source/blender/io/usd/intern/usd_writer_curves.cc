@@ -35,7 +35,10 @@
 
 #include "BLT_translation.hh"
 
+#include "DEG_depsgraph_query.hh"
+
 #include "DNA_curve_types.h"
+#include "DNA_curves_types.h"
 #include "DNA_material_types.h"
 #include "DNA_object_types.h"
 
@@ -43,6 +46,28 @@
 #include "RNA_enum_types.hh"
 
 namespace blender::io::usd {
+
+/* On Geometry-Nodes-driven curves (e.g. brushstroke generators) the depsgraph-evaluated
+ * Curves data block can lose its material slots even when `Object::totcol` still
+ * reflects the source material. `BKE_object_material_get` consults the *evaluated*
+ * data's slot count and returns nullptr in that case, which silently drops the
+ * material binding from the exported USD. Resolve via the original Object so the
+ * source slot survives the GN round-trip. */
+static Material *resolve_object_material_slot(const Object *eval_obj, short slot_index_1_based)
+{
+  if (!eval_obj) {
+    return nullptr;
+  }
+  Material *material = BKE_object_material_get(const_cast<Object *>(eval_obj), slot_index_1_based);
+  if (material != nullptr) {
+    return material;
+  }
+  Object *orig_obj = DEG_get_original(const_cast<Object *>(eval_obj));
+  if (orig_obj == nullptr || orig_obj == eval_obj) {
+    return nullptr;
+  }
+  return BKE_object_material_get(orig_obj, slot_index_1_based);
+}
 
 pxr::UsdGeomBasisCurves USDCurvesWriter::DefineUsdGeomBasisCurves(pxr::VtValue curve_basis,
                                                                   const bool is_cyclic,
@@ -708,7 +733,7 @@ void USDCurvesWriter::assign_materials(const HierarchyContext &context,
 
   bool curve_material_bound = false;
   for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
-    Material *material = BKE_object_material_get(context.object, mat_num + 1);
+    Material *material = resolve_object_material_slot(context.object, mat_num + 1);
     if (material == nullptr) {
       continue;
     }
