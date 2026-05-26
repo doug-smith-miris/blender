@@ -26,6 +26,7 @@
 #include "BLI_map.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_set.hh"
+#include "BLI_span.hh"
 #include "BLI_string.h"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utils.hh"
@@ -1085,33 +1086,57 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree.  Returns null if no instance of either type was found. */
-static bNode *find_bsdf_node(Material *material)
+/* Recursively searches a node tree -- descending into any nested node groups -- for the first
+ * node whose legacy type is one of `node_types`. Returns null if none is found.
+ *
+ * Descending into groups is required for AYON-style materials (e.g. swarmfish
+ * `creature_eyes` / `creature_pupil`) whose shader network is wrapped in a #ShaderNodeGroup
+ * that exposes only a Surface output. Such a group node is the only top-level node feeding
+ * Material Output, so a flat scan of the material's node tree never reaches the BSDF and the
+ * UsdPreviewSurface writer would emit an empty `def Material {}` prim. */
+static bNode *find_node_of_type_recursive(bNodeTree *ntree, const blender::Span<int> node_types)
 {
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
+  if (!ntree) {
+    return nullptr;
+  }
+
+  for (bNode *node : ntree->all_nodes()) {
+    if (node_types.contains(node->type_legacy)) {
       return node;
+    }
+  }
+
+  /* No match at this level: descend into node groups. */
+  for (bNode *node : ntree->all_nodes()) {
+    if (node->is_group()) {
+      if (bNode *found = find_node_of_type_recursive(reinterpret_cast<bNodeTree *>(node->id),
+                                                     node_types))
+      {
+        return found;
+      }
     }
   }
 
   return nullptr;
 }
 
+/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
+ * material's node tree (including inside nested node groups).  Returns null if no instance of
+ * either type was found. */
+static bNode *find_bsdf_node(Material *material)
+{
+  return find_node_of_type_recursive(material->nodetree,
+                                     {SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE});
+}
+
 /**
  * Returns the first occurrence of a scalar Displacement node found in the given
- * material's node tree. Vector Displacement is not supported in the #UsdPreviewSurface.
- * Returns null if no instance of either type was found.
+ * material's node tree (including inside nested node groups). Vector Displacement is not
+ * supported in the #UsdPreviewSurface. Returns null if no instance of either type was found.
  */
 static bNode *find_displacement_node(Material *material)
 {
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (node->type_legacy == SH_NODE_DISPLACEMENT) {
-      return node;
-    }
-  }
-
-  return nullptr;
+  return find_node_of_type_recursive(material->nodetree, {SH_NODE_DISPLACEMENT});
 }
 
 /* Creates a USD Preview Surface shader based on the given cycles node name and type. */
