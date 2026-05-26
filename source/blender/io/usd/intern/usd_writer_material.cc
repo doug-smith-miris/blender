@@ -42,9 +42,11 @@
 
 #ifdef WITH_MATERIALX
 #  include "shader/materialx/material.h"
+#  include <MaterialXCore/Node.h>
 #  include <pxr/usd/sdf/copyUtils.h>
 #  include <pxr/usd/usdMtlx/materialXConfigAPI.h>
 #  include <pxr/usd/usdMtlx/reader.h>
+#  include <pxr/usd/usdMtlx/utils.h>
 #endif
 
 #include "CLG_log.h"
@@ -1479,6 +1481,99 @@ pxr::TfToken token_for_input(const StringRef input_name)
 }
 
 #ifdef WITH_MATERIALX
+/* Substitute MaterialX nodes whose category has no NodeDef in the standard library with a
+ * typed identity that produces a no-contribution output of the same MaterialX type.
+ *
+ * BL-MAT-002: Blender's `Principled BSDF` MaterialX writer (`node_shader_bsdf_principled.cc`)
+ * unconditionally builds a `thin_film_bsdf` MaterialX node, but MaterialX 1.39's standard
+ * library has no `thin_film_bsdf` NodeDef -- thin-film is only exposed as an internal layer
+ * of `standard_surface` / `open_pbr_surface`. When `pxr::UsdMtlxRead` then converts the
+ * document to USD it emits a `def Shader` prim with no `info:id` (and warns "Unable to find
+ * the nodedef for 'node_NN' node, outputs not added.") and drops the downstream
+ * `inputs:top.connect` on the `layer_bsdf` that was layering thin-film on top of the metal
+ * mix.  Karma's MtlX shader generator then fails to compile the resulting graph with
+ * "Reference to undefined variable: out_N" because the layer's `top` input is left declared
+ * but unconnected, and `ND_layer_bsdf` has no default value for a BSDF input.
+ *
+ * Rewriting the unknown node in place (rather than removing it) preserves its name, so the
+ * downstream `inputs:top` connection that `pxr::UsdMtlxRead` would otherwise drop survives
+ * the conversion. The substitution targets MaterialX-level types (BSDF, EDF, value types);
+ * everything else passes through unchanged. */
+static void substitute_undefined_materialx_nodes(MaterialX::DocumentPtr doc)
+{
+  /* Import the bundled MaterialX standard library so `node->getNodeDef()` resolves against
+   * the same set that `pxr::UsdMtlxRead` will use on the next line. UsdMtlxGetDocument("")
+   * returns the cached, rolled-up standard library document. */
+  MaterialX::ConstDocumentPtr stdlib = pxr::UsdMtlxGetDocument("");
+  if (!stdlib) {
+    return;
+  }
+  doc->importLibrary(stdlib);
+
+  auto rewrite_node = [](MaterialX::NodePtr node) {
+    const std::string type = node->getType();
+    const std::string original_category = node->getCategory();
+    CLOG_WARN(&LOG,
+              "MaterialX export: substituting unknown node '%s' (category=%s, type=%s) "
+              "with a no-contribution identity so downstream connections remain valid.",
+              node->getName().c_str(),
+              original_category.c_str(),
+              type.c_str());
+
+    /* Inputs were typed for the now-unknown category and would be invalid on the
+     * identity replacement; clear them first. */
+    for (MaterialX::InputPtr &input : node->getInputs()) {
+      node->removeInput(input->getName());
+    }
+
+    if (type == "BSDF") {
+      node->setCategory("oren_nayar_diffuse_bsdf");
+      node->setInputValue("weight", 0.0f);
+      node->setInputValue("color", MaterialX::Color3(0.0f, 0.0f, 0.0f));
+    }
+    else if (type == "EDF") {
+      node->setCategory("uniform_edf");
+      node->setInputValue("color", MaterialX::Color3(0.0f, 0.0f, 0.0f));
+    }
+    else if (type == "color3") {
+      node->setCategory("constant");
+      node->setInputValue("value", MaterialX::Color3(0.0f, 0.0f, 0.0f));
+    }
+    else if (type == "color4") {
+      node->setCategory("constant");
+      node->setInputValue("value", MaterialX::Color4(0.0f, 0.0f, 0.0f, 0.0f));
+    }
+    else if (type == "vector3") {
+      node->setCategory("constant");
+      node->setInputValue("value", MaterialX::Vector3(0.0f, 0.0f, 0.0f));
+    }
+    else if (type == "vector2") {
+      node->setCategory("constant");
+      node->setInputValue("value", MaterialX::Vector2(0.0f, 0.0f));
+    }
+    else if (type == "float") {
+      node->setCategory("constant");
+      node->setInputValue("value", 0.0f);
+    }
+    /* Other MaterialX types (DisplacementShader, VDF, surfaceshader, ...) are uncommon as
+     * unknown-category outputs in the Blender writer. Leave the node as-is and let the
+     * existing UsdMtlxRead warning surface them. */
+  };
+
+  for (MaterialX::NodePtr &node : doc->getNodes()) {
+    if (!node->getNodeDef()) {
+      rewrite_node(node);
+    }
+  }
+  for (MaterialX::NodeGraphPtr &graph : doc->getNodeGraphs()) {
+    for (MaterialX::NodePtr &node : graph->getNodes()) {
+      if (!node->getNodeDef()) {
+        rewrite_node(node);
+      }
+    }
+  }
+}
+
 /* A wrapper for the MaterialX code to re-use the standard Texture export code */
 static std::string materialx_export_image(const USDExporterContext &usd_export_context,
                                           Main * /*main*/,
@@ -1549,6 +1644,13 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
 
   MaterialX::DocumentPtr doc = nodes::materialx::export_to_materialx(
       usd_export_context.depsgraph, material, export_params);
+
+  /* Replace any nodes whose category has no NodeDef in the MaterialX standard library with
+   * a typed-identity equivalent. See `substitute_undefined_materialx_nodes` for the
+   * BL-MAT-002 background. Must run before `UsdMtlxRead` so that downstream connections
+   * to the rewritten nodes are preserved (UsdMtlxRead silently drops connections sourced
+   * from nodes it cannot resolve). */
+  substitute_undefined_materialx_nodes(doc);
 
   /* We want to merge the MaterialX graph under the same Material as the USDPreviewSurface
    * This allows for the same material assignment to have two levels of complexity so other
