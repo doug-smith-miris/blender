@@ -684,12 +684,51 @@ NODE_SHADER_MATERIALX_BEGIN
       NodeItem anisotropy = in["anisotropic"];
       NodeItem tangent = in["tangent"];
       if (anisotropy) {
-        /* Anisotropy scaled down to approximately match the principled BSDF. */
-        anisotropy = anisotropy * val(0.7f);
+        /* Bridge Blender Principled BSDF's anisotropy convention to MaterialX OpenPBR's
+         * `geometry_tangent` axis. Two empirical adjustments are needed:
+         *
+         * 1. Magnitude scaling (`OPENPBR_ANISOTROPY_VISUAL_SCALE`): Cycles squeezes the
+         *    roughness along one axis with `aspect = sqrt(1 - anisotropic * 0.9)`
+         *    (intern/cycles/kernel/svm/closure.h). OpenPBR's
+         *    `specular_roughness_anisotropy` uses a different aspect-ratio mapping, so a
+         *    constant scale was tuned to visually match Cycles in side-by-side renders.
+         *
+         * 2. Axis rotation (`OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG` + negation):
+         *    - Blender Principled BSDF (Cycles): `T' = rotate_around_axis(T, N, rot * 2π)`
+         *      with `rot = 0` putting the highlight perpendicular to T (along the
+         *      bitangent B = N × T) — see closure.h:167.
+         *    - OpenPBR `geometry_tangent`: the input vector is itself the primary axis
+         *      along which roughness is elongated. So with `rot = 0` and an unrotated T,
+         *      OpenPBR would elongate along T while Cycles elongates along B — a
+         *      90° mismatch. The fixed `+90°` rotates Blender's T to the bitangent so
+         *      the `rot = 0` highlights match.
+         *    - The leading negation flips rotation direction: Cycles' `rotate_around_axis`
+         *      rotates counter-clockwise when viewed from `+N`, while MaterialX
+         *      `rotate3d`'s right-handed rotation about `N` produces the opposite visual
+         *      direction once the resulting vector becomes OpenPBR's anisotropy axis.
+         *
+         * Correctness assumptions, sanity-checked when changing this block:
+         *   - Blender's MaterialX `tangent space=world` node (see node_shader_tangent.cc)
+         *     resolves to the same UV-derived first basis Cycles uses for `T`. UV winding
+         *     order does not invalidate the rotation because both sides consume the same
+         *     UV-derived tangent.
+         *   - When the artist wires an external vector into the Tangent input, that
+         *     vector is rotated under the same convention — i.e. the caller is expected
+         *     to provide a Blender-Principled-style tangent direction.
+         *   - The lower-level MaterialX `BSDF` path above (case NodeItem::Type::BSDF)
+         *     uses a clean `aniso_rot * 360°` rotation with no offset or inversion,
+         *     because `dielectric_bsdf`/`conductor_bsdf` interpret `tangent` directly as
+         *     the rotated Blender tangent — the offset is OpenPBR-specific.
+         */
+        constexpr float OPENPBR_ANISOTROPY_VISUAL_SCALE = 0.7f;
+        constexpr float OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG = 90.0f;
+        constexpr float OPENPBR_ANISOTROPIC_ROTATION_TO_DEG = 360.0f;
 
-        /* Rotation is offset by 90 degrees and inverted to approximately align visually with
-         * principled BSDF direction. */
-        NodeItem rotation = -((in["anisotropic_rotation"] * val(360.0f)) + val(90.0f));
+        anisotropy = anisotropy * val(OPENPBR_ANISOTROPY_VISUAL_SCALE);
+
+        NodeItem rotation = -((in["anisotropic_rotation"] *
+                               val(OPENPBR_ANISOTROPIC_ROTATION_TO_DEG)) +
+                              val(OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG));
 
         /* Only create a normal node locally if we need to use it to rotate the tangent vector.
          * we don't actually pass this to the exported material. */
