@@ -553,12 +553,15 @@ static void get_positions(const Mesh *mesh, USDMeshData &usd_mesh_data)
 
 static void get_loops_polys(const Mesh *mesh, USDMeshData &usd_mesh_data)
 {
-  /* Only construct face groups (a.k.a. geometry subsets) when we need them for material
-   * assignments. */
-  const bke::AttributeAccessor attributes = mesh->attributes();
-  const VArray<int> material_indices = *attributes.lookup_or_default<int>(
-      "material_index", bke::AttrDomain::Face, 0);
-  if (!material_indices.is_single() && mesh->totcol > 1) {
+  /* Build face groups (a.k.a. geometry subsets) whenever the mesh declares more than one
+   * material slot. We still populate face_groups when all faces happen to use a single
+   * slot index, so that every declared slot can be authored as a UsdGeomSubset on export
+   * — see BL-MAT-007. Slots with no faces using them are authored with an empty
+   * `indices` array by assign_materials. */
+  if (mesh->totcol > 1) {
+    const bke::AttributeAccessor attributes = mesh->attributes();
+    const VArray<int> material_indices = *attributes.lookup_or_default<int>(
+        "material_index", bke::AttrDomain::Face, 0);
     const VArraySpan<int> indices_span(material_indices);
     for (const int i : indices_span.index_range()) {
       usd_mesh_data.face_groups.lookup_or_add_default(indices_span[i]).push_back(i);
@@ -668,25 +671,27 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
     usd_mesh.CreateDoubleSidedAttr(pxr::VtValue(true));
   }
 
-  if (!mesh_material_bound || usd_face_groups.size() < 2) {
-    /* Either all material slots were empty or there is only one material in use. As geometry
-     * subsets are only written when actually used to assign a material, and the mesh already has
-     * the material assigned, there is no need to continue. */
+  if (!mesh_material_bound || context.object->totcol < 2) {
+    /* No subsets are needed if no material is bound or the mesh declares one slot. */
     return;
   }
 
-  /* Define a geometry subset per material. */
-  for (const MaterialFaceGroups::Item &face_group : usd_face_groups.items()) {
-    short material_number = face_group.key;
-    const pxr::VtIntArray &face_indices = face_group.value;
-
-    Material *material = BKE_object_material_get(context.object, material_number + 1);
+  /* Define one UsdGeomSubset of family `materialBind` per declared, non-empty material
+   * slot. Slots that have no faces using them on this mesh are still authored — with an
+   * empty `indices` array — so the multi-slot structure of the source mesh round-trips
+   * through USD. See BL-MAT-007-multi-material-mesh-geomsubsets-missing. */
+  const pxr::VtIntArray empty_indices;
+  for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
+    Material *material = BKE_object_material_get(context.object, mat_num + 1);
     if (material == nullptr) {
       continue;
     }
 
     pxr::UsdShadeMaterial usd_material = ensure_usd_material(context, material);
     pxr::TfToken material_name = usd_material.GetPath().GetNameToken();
+
+    const pxr::VtIntArray *face_indices_ptr = usd_face_groups.lookup_ptr(short(mat_num));
+    const pxr::VtIntArray &face_indices = face_indices_ptr ? *face_indices_ptr : empty_indices;
 
     pxr::UsdGeomSubset usd_face_subset = material_binding_api.CreateMaterialBindSubset(
         material_name, face_indices);
