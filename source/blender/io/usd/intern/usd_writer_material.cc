@@ -1087,8 +1087,51 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
+/* Forward decl: find_connected_bsdf and find_bsdf_via_group_output recurse mutually. */
+static bNode *find_connected_bsdf(const bNodeSocket *socket);
+
+/* When upstream traversal reaches a ShaderNodeGroup, descend into the group's
+ * inner node tree and continue walking from the matching NodeGroupOutput input
+ * socket. Returns null if the group is broken, has no active NodeGroupOutput,
+ * or has no matching internal socket.
+ *
+ * Why this matters (BL-MAT-shadernodegroup-output-empty-prim): artists
+ * routinely wrap shader networks in a node group and only expose a single
+ * Surface output. The Principled BSDF then lives inside the group, not in the
+ * material's top-level node tree. Before this descent, `find_connected_bsdf`
+ * stopped at the group boundary (since its `inputs` are the external interface,
+ * not the inner graph), and the legacy `all_nodes()` fallback only scans the
+ * top-level tree — so `find_bsdf_node` returned null and the exporter emitted
+ * an empty `def Material "name" {}` with zero Shader descendants. */
+static bNode *find_bsdf_via_group_output(const bNode *group_node,
+                                         const bNodeSocket *external_out)
+{
+  if (!group_node || !external_out) {
+    return nullptr;
+  }
+  bNodeTree *inner = reinterpret_cast<bNodeTree *>(group_node->id);
+  if (!inner) {
+    return nullptr;
+  }
+  inner->ensure_topology_cache();
+  const bNode *group_output_node = inner->group_output_node();
+  if (!group_output_node) {
+    return nullptr;
+  }
+  /* External outputs on a Group node and the internal NodeGroupOutput's input
+   * sockets share identifiers across the interface — match by identifier so we
+   * are robust to virtual extension sockets and reordering. */
+  for (const bNodeSocket &internal_in : group_output_node->inputs) {
+    if (STREQ(internal_in.identifier, external_out->identifier)) {
+      return find_connected_bsdf(&internal_in);
+    }
+  }
+  return nullptr;
+}
+
 /* Walk upstream from the given socket through pass-through nodes (reroutes, Mix Shader,
- * Add Shader, etc.) and return the first connected Principled/Diffuse BSDF, or null. */
+ * Add Shader, etc.) and return the first connected Principled/Diffuse BSDF, or null.
+ * Descends into ShaderNodeGroup nodes via find_bsdf_via_group_output. */
 static bNode *find_connected_bsdf(const bNodeSocket *socket)
 {
   if (!socket || !socket->link || !socket->link->fromnode) {
@@ -1097,6 +1140,12 @@ static bNode *find_connected_bsdf(const bNodeSocket *socket)
   bNode *from = socket->link->fromnode;
   if (ELEM(from->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
     return from;
+  }
+  if (from->is_group()) {
+    /* The external `inputs` of a group node are values flowing IN, not the
+     * graph that produced the upstream output we are tracing — so do NOT fall
+     * through to the generic input-iteration after descending. */
+    return find_bsdf_via_group_output(from, socket->link->fromsock);
   }
   for (const bNodeSocket &sock : from->inputs) {
     if (bNode *found = find_connected_bsdf(&sock)) {
