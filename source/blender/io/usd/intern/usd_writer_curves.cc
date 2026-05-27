@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <algorithm>
 #include <cstdint>
 #include <numeric>
 
@@ -34,6 +35,8 @@
 #include "BKE_report.hh"
 
 #include "BLT_translation.hh"
+
+#include "DEG_depsgraph_query.hh"
 
 #include "DNA_curve_types.h"
 #include "DNA_material_types.h"
@@ -702,13 +705,37 @@ void USDCurvesWriter::do_write(HierarchyContext &context)
 void USDCurvesWriter::assign_materials(const HierarchyContext &context,
                                        const pxr::UsdGeomCurves &usd_curves)
 {
-  if (context.object->totcol == 0) {
+  /* Geometry Nodes networks frequently assign materials directly to the *evaluated* curve data
+   * (e.g. the brushstroke-tools "surface_fill"/"Set Material" graphs that drive swarmfish's
+   * painterly fins and creature_trail FX). In that case the realized Curves data carries the
+   * materials while the Object's own slot count (`Object::totcol`) stays at 0, so the previous
+   * lookup via `Object::totcol` + `BKE_object_material_get` silently dropped them. The eval-aware
+   * material API consults the evaluated object *data* (see BKE_object_material_get_eval), matching
+   * how the renderer resolves materials, so GN-driven curve carriers keep their bindings. */
+  /* The original (pre-evaluation) Object retains the material slots the artist assigned in the
+   * .blend even when Geometry Nodes evaluation replaces the Curves data block with a realized one
+   * that has dropped them (or left the slot's material pointer null). We consult it as a fallback
+   * so GN-driven curve carriers such as swarmfish's `creature-BS` brushstrokes keep their
+   * material instead of being silently dropped. */
+  Object *orig_object = DEG_get_original(context.object);
+  const int eval_count = BKE_object_material_count_eval(context.object);
+  const int orig_count = orig_object ? orig_object->totcol : 0;
+  const int totcol = std::max(eval_count, orig_count);
+  if (totcol == 0) {
     return;
   }
 
   bool curve_material_bound = false;
-  for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
-    Material *material = BKE_object_material_get(context.object, mat_num + 1);
+  for (int mat_num = 0; mat_num < totcol; mat_num++) {
+    /* Prefer the evaluated material (it reflects GN "Set Material" assignments); fall back to the
+     * original object's slot when the evaluated lookup yields nothing. */
+    Material *material = nullptr;
+    if (mat_num < eval_count) {
+      material = BKE_object_material_get_eval(context.object, mat_num + 1);
+    }
+    if (material == nullptr && orig_object != nullptr && mat_num < orig_count) {
+      material = BKE_object_material_get(orig_object, mat_num + 1);
+    }
     if (material == nullptr) {
       continue;
     }
