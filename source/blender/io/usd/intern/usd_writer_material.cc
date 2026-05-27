@@ -1061,12 +1061,73 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
   return wrap;
 }
 
-/* Search the upstream node links connected to the given socket and return the first occurrence
- * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null. */
+/* Returns true if `sock_name` (the Blender display name of an input socket)
+ * is one of the signal-carrying inputs we are willing to descend into when
+ * walking upstream from `linked_node` looking for `target_type`. */
+static bool is_signal_carrying_input(const bNode *linked_node, const char *sock_name)
+{
+  if (!linked_node || !sock_name) {
+    return false;
+  }
+  switch (linked_node->type_legacy) {
+    /* Reroute has a single (unnamed) input that always carries the signal. */
+    case NODE_REROUTE:
+      return true;
+    /* Texture-on-color chains: the Color input carries the upstream image. */
+    case SH_NODE_NORMAL_MAP:
+    case SH_NODE_SEPARATE_COLOR:
+      return STREQ(sock_name, "Color");
+    /* Bump / Displacement: the Height input carries the upstream texture. */
+    case SH_NODE_BUMP:
+    case SH_NODE_DISPLACEMENT:
+      return STREQ(sock_name, "Height");
+    /* Combine Color: pass through the per-channel inputs in RGB mode. */
+    case SH_NODE_COMBINE_COLOR:
+      return STREQ(sock_name, "Red") || STREQ(sock_name, "Green") || STREQ(sock_name, "Blue");
+    /* Mapping: only the Vector input carries the upstream UV/coord source. */
+    case SH_NODE_MAPPING:
+      return STREQ(sock_name, "Vector");
+    /* Math: the two Value operands carry the upstream value. */
+    case SH_NODE_MATH:
+      return STREQ(sock_name, "Value");
+    /* Vector Math: the two Vector operands carry the upstream vector. */
+    case SH_NODE_VECTOR_MATH:
+      return STREQ(sock_name, "Vector");
+    default:
+      /* Color-modifying or value-modulating intermediates we cannot represent
+       * losslessly in UsdPreviewSurface (RGB Curves, Hue/Saturation, Float
+       * Curve, Color Ramp, Mix, Map Range, Clamp, Gamma, Brightness/Contrast,
+       * Invert, ...) and unknown node types: refuse to descend. Walking
+       * through them would silently flatten the artist's intent — and worse,
+       * a deep DFS through unrelated control inputs (Hue, Saturation, Factor,
+       * Map-Range From/To-Min/Max, ColorRamp Fac) can latch onto an Image
+       * Texture from a totally different channel and attach it as the source
+       * for this input. See BL-MAT-traverse-channel-naive-dfs-wrong-input-
+       * wiring. */
+      return false;
+  }
+}
+
+/* Walks upstream from the given input socket and returns the first link
+ * whose fromnode is of `target_type`. Returns null if no such terminal can
+ * be reached following only signal-carrying inputs (see
+ * `is_signal_carrying_input`). The returned link's `fromnode` and `fromsock`
+ * are guaranteed non-null.
+ *
+ * Implementation note (BL-MAT-traverse-channel-naive-dfs-wrong-input-wiring):
+ * the prior implementation did a naive DFS through *every* input of every
+ * intermediate node, including modulator and control inputs of color-
+ * modifying nodes. That caused the BSDF's Base Color traversal to find and
+ * attach an Image Texture wired into a completely unrelated control channel
+ * (e.g. a Hue/Saturation Hue operand, a Mix Factor driven by Map Range, a
+ * ColorRamp Fac). The exported UsdPreviewSurface ended up with diffuseColor
+ * pointing at the roughness texture, normal pointing at the diffuse texture,
+ * and so on. This version restricts the descent to nodes whose signal-flow
+ * we can identify, and halts at color-modifying intermediates rather than
+ * misattributing the deeper image. */
 static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
 {
-  if (!(input->link && input->link->fromnode && input->link->fromsock)) {
+  if (!(input && input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
   }
 
@@ -1076,8 +1137,11 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
     return input->link;
   }
 
-  /* Recursively traverse the linked node's sockets. */
+  /* Recursively traverse only the signal-carrying inputs of the linked node. */
   for (bNodeSocket &sock : linked_node->inputs) {
+    if (!is_signal_carrying_input(linked_node, sock.name)) {
+      continue;
+    }
     if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
       return found_link;
     }
