@@ -55,6 +55,24 @@ namespace usdtokens {
 static const pxr::TfToken pole_axis_z("Z", pxr::TfToken::Immortal);
 }  // namespace usdtokens
 
+/* BL-LIT-002: Blender↔USD world-dome brightness conversion.
+ *
+ * Unlike Blender's local lights (Point/Spot/Area/Sun), whose Power is denominated in Watts and
+ * therefore needs a radiometric Watts→nit/lux conversion to land on the UsdLux physical-unit
+ * scale, a World's Background `Strength` is already a *dimensionless radiance multiplier* applied
+ * to the environment color/texture. UsdLuxDomeLight `inputs:intensity` is likewise a linear
+ * radiance multiplier on `inputs:texture:file` / `inputs:color`. The physically-consistent map is
+ * therefore unity — and Blender's own importer round-trips it as unity
+ * (`dome_light_to_world_material` sets Background.Strength = intensity * light_intensity_scale).
+ *
+ * The residual Cycles-vs-Karma brightness gap that BL-LIT-002 tracks is NOT a units error in the
+ * authored value: with intensity authored from Strength the radiance multiplier matches. The gap
+ * that remains is a renderer-interpretation difference, addressed structurally by also authoring
+ * `inputs:texture:format = latlong` (so Karma samples the equirect map rather than falling back to
+ * a darker default projection) and the Karma camera-visibility primvar. We keep the scale as an
+ * explicit, named unity constant so a future radiometric tune has a single, documented seam. */
+static constexpr float WORLD_DOME_LIGHT_INTENSITY_SCALE = 1.0f;
+
 namespace {
 
 struct WorldNtreeSearchPayload {
@@ -174,11 +192,42 @@ void world_material_to_dome_light(const USDExportParams &params,
   pxr::UsdLuxDomeLight dome_light = pxr::UsdLuxDomeLight::Define(stage, env_light_path);
   colorspace_apply_to_prim(dome_light.GetPrim());
 
+  /* BL-LIT-002 / BL-LIT-005: always author `inputs:intensity` from the Background node's
+   * Strength, whether the world is a textured environment or a solid color. The stock image
+   * branch never authored intensity, silently defaulting the dome to 1.0 and discarding any
+   * non-default Strength the artist set — so an HDRI lit at Strength=5 round-tripped as a dome
+   * at intensity=1, lighting the scene 5x too dimly versus the Cycles reference. The world
+   * Strength is a dimensionless radiance multiplier, so the conversion is unity (see
+   * WORLD_DOME_LIGHT_INTENSITY_SCALE). */
+  if (res.color_found) {
+    dome_light.CreateIntensityAttr().Set(res.intensity * WORLD_DOME_LIGHT_INTENSITY_SCALE);
+  }
+
+  /* Make the dome backdrop explicitly camera-visible for Karma. Hydra delegates that consult
+   * the Karma object-visibility primvar otherwise see no authored visibility for the dome and
+   * may skip it on primary camera rays, producing a blown-out/grey backdrop while indirect
+   * lighting still works. `"*"` keeps the dome visible across all ray classes; delegates that
+   * don't know the primvar ignore it. */
+  pxr::UsdAttribute karma_vis = dome_light.GetPrim().CreateAttribute(
+      pxr::TfToken("primvars:karma:object:rendervisibility"),
+      pxr::SdfValueTypeNames->String,
+      /*custom=*/false,
+      pxr::SdfVariabilityUniform);
+  karma_vis.Set(std::string("*"));
+
   if (res.image) {
     /* Use existing image texture file. */
     dome_light.CreateTextureFileAttr().Set(pxr::SdfAssetPath(image_filepath));
 
-    /* Set optional color multiplication. */
+    /* Blender's Environment Texture node always emits an equirectangular (lat-long) projection.
+     * Authoring the format explicitly (rather than leaving the schema default `automatic`) keeps
+     * Karma — which documents lat-long-only dome maps — from sampling the map with a darker or
+     * mismatched projection, a contributor to the BL-LIT-002 brightness divergence. */
+    dome_light.CreateTextureFormatAttr().Set(pxr::UsdLuxTokens->latlong);
+
+    /* Set optional color multiplication (a Background-color tint applied through a Vector Math
+     * multiply upstream of the Environment Texture). Propagating it to `inputs:color` keeps the
+     * dome's hue matched to Cycles instead of defaulting to neutral white. */
     if (res.mult_found) {
       pxr::GfVec3f color_val(res.color_mult[0], res.color_mult[1], res.color_mult[2]);
       dome_light.CreateColorAttr().Set(color_val);
@@ -193,9 +242,8 @@ void world_material_to_dome_light(const USDExportParams &params,
   }
   else if (res.color_found) {
     /* If no texture is found export a solid color texture as a stand-in so that Hydra
-     * renderers don't throw errors. */
-    dome_light.CreateIntensityAttr().Set(res.intensity);
-
+     * renderers don't throw errors. Intensity is already authored above from the Background
+     * node's Strength. */
     std::string source_path = cache_image_color(res.color);
     const std::string base_path = stage->GetRootLayer()->GetRealPath();
 
