@@ -180,6 +180,35 @@ static void set_scale_bias(pxr::UsdShadeShader &usd_shader,
   bias_attr.Set(bias);
 }
 
+/* Returns true if `input` is driven -- possibly through Reroute / Math / Mix
+ * intermediates -- by a Light Path or Transparent BSDF node, i.e. the artist
+ * built a render-visibility "cutout" (the swarmfish `creature_body` Alpha is
+ * `Mix(fac = Light Path > Is Camera Ray)`) rather than a literal per-pixel
+ * surface transparency.
+ *
+ * Such a cutout has no faithful UsdPreviewSurface representation: the surface
+ * is fully visible to the camera and the Light Path expression only suppresses
+ * it for *secondary* rays. Recognising it lets the writer resolve opacity to
+ * the fully-opaque default rather than collapse the chain to the linked
+ * socket's stale `default_value` (which for creature_body is 0.0, otherwise
+ * exporting `opacity = 0` and rendering the body invisible in Karma). */
+static bool opacity_socket_drives_visibility_cutout(bNodeSocket *input, int depth = 0)
+{
+  if (!input || !input->link || !input->link->fromnode || depth > 32) {
+    return false;
+  }
+  const bNode *node = input->link->fromnode;
+  if (node->type_legacy == SH_NODE_LIGHT_PATH || node->type_legacy == SH_NODE_BSDF_TRANSPARENT) {
+    return true;
+  }
+  for (bNodeSocket &sock : input->link->fromnode->inputs) {
+    if (opacity_socket_drives_visibility_cutout(&sock, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static void process_inputs(const USDExporterContext &usd_export_context,
                            pxr::UsdShadeMaterial &usd_material,
                            pxr::UsdShadeShader &shader,
@@ -423,9 +452,42 @@ static void process_inputs(const USDExporterContext &usd_export_context,
     if (input_spec.set_default_value) {
       switch (sock.type) {
         case SOCK_FLOAT: {
-          const bool is_inverted = input_spec.input_name == usdtokens::opacity;
-          const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
-          create_input(shader, input_spec, is_inverted ? (1.0f - val) : val, input_scale);
+          if (input_spec.input_name == usdtokens::opacity) {
+            /* Both Principled "Alpha" and "Transmission Weight" map to
+             * UsdPreviewSurface opacity. This default-constant fallback is also
+             * reached when the socket is *linked* to a shader-graph expression
+             * the writer could not reduce to a representable texture / attribute
+             * source. For a linked socket the stored `default_value` is stale and
+             * meaningless, so emitting (or inverting) it silently collapses the
+             * surface to `opacity = 0` -- fully invisible. This is exactly what
+             * happens for an Alpha cutout built from Light Path / Transparent
+             * BSDF (swarmfish creature_body, whose leftover Alpha default is
+             * 0.0): the body is in fact fully visible to the camera. Resolve a
+             * linked, unrepresentable opacity to the fully-opaque default. */
+            if (sock.link) {
+              CLOG_WARN(&LOG,
+                        "Opacity input '%s' is driven by an unrepresentable shader graph%s; "
+                        "authoring opacity = 1.0 (opaque) rather than collapsing the chain.",
+                        sock.name,
+                        opacity_socket_drives_visibility_cutout(&sock) ?
+                            " (Light Path / Transparent BSDF visibility cutout)" :
+                            "");
+              create_input(shader, input_spec, 1.0f, input_scale);
+            }
+            else {
+              /* Unlinked constant. Alpha maps directly to opacity (alpha = 1 ->
+               * opaque); Transmission Weight is the complement (transmission =
+               * 1 -> fully transmissive -> opacity = 0). */
+              const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
+              const bool is_transmission = STREQ(sock.name, "Transmission Weight");
+              create_input(
+                  shader, input_spec, is_transmission ? (1.0f - val) : val, input_scale);
+            }
+          }
+          else {
+            const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
+            create_input(shader, input_spec, val, input_scale);
+          }
         } break;
         case SOCK_VECTOR: {
           const float *val = sock.default_value_typed<bNodeSocketValueVector>()->value;
