@@ -7,6 +7,7 @@
 #include "node_parser.h"
 
 #include "BKE_lib_id.hh"
+#include "BKE_node_legacy_types.hh"
 
 #include "DEG_depsgraph.hh"
 
@@ -66,11 +67,54 @@ MaterialX::DocumentPtr export_to_materialx(Depsgraph *depsgraph,
       nullptr, "Inlined Tree", material->nodetree->idname);
   BLI_SCOPED_DEFER([&]() { BKE_id_free(nullptr, &local_tree->id); });
 
+  /* Pick an engine target that the source tree actually has a Material Output for.
+   * The inliner filters Material Output nodes by `params.target_engine_` (only ALL +
+   * matching-target outputs are processed) AND `ntreeShaderOutputNode(_, target)` only
+   * matches outputs whose `custom1` is SHD_OUTPUT_ALL or the requested target. Production
+   * .blends often have only SHD_OUTPUT_CYCLES (and/or SHD_OUTPUT_EEVEE) Material Outputs —
+   * the artist's authoritative offline-rendering network. With the default
+   * target=SHD_OUTPUT_ALL the inliner would skip those output sockets entirely and
+   * `ntreeShaderOutputNode` would return null, dropping into compute_error() and emitting
+   * a magenta open_pbr_surface stub in place of the real MaterialX network. Prefer ALL,
+   * then CYCLES (the closest renderer convention for MaterialX consumers like Karma),
+   * then EEVEE. */
+  NodeShaderOutputTarget mtlx_target = SHD_OUTPUT_ALL;
+  if (material->nodetree) {
+    bool has_all = false, has_cycles = false, has_eevee = false;
+    for (const bNode *src_node : material->nodetree->all_nodes()) {
+      if (src_node->type_legacy != SH_NODE_OUTPUT_MATERIAL) {
+        continue;
+      }
+      switch (src_node->custom1) {
+        case SHD_OUTPUT_ALL:
+          has_all = true;
+          break;
+        case SHD_OUTPUT_CYCLES:
+          has_cycles = true;
+          break;
+        case SHD_OUTPUT_EEVEE:
+          has_eevee = true;
+          break;
+        default:
+          break;
+      }
+    }
+    if (!has_all) {
+      if (has_cycles) {
+        mtlx_target = SHD_OUTPUT_CYCLES;
+      }
+      else if (has_eevee) {
+        mtlx_target = SHD_OUTPUT_EEVEE;
+      }
+    }
+  }
+
   InlineShaderNodeTreeParams params;
+  params.target_engine_ = mtlx_target;
   inline_shader_node_tree(*material->nodetree, *local_tree, params);
 
   local_tree->ensure_topology_cache();
-  bNode *output_node = ntreeShaderOutputNode(local_tree, SHD_OUTPUT_ALL);
+  bNode *output_node = ntreeShaderOutputNode(local_tree, mtlx_target);
   if (output_node && output_node->typeinfo->materialx_fn) {
     NodeParserData data = {graph, NodeItem::Type::Material, nullptr, graph.empty_node()};
     output_node->typeinfo->materialx_fn(&data, output_node, nullptr);
