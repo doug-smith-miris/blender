@@ -784,13 +784,6 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
     return;
   }
 
-  if (mapping_node->custom1 != TEXMAP_TYPE_POINT) {
-    if (bNodeSocket *socket = bke::node_find_socket(*mapping_node, SOCK_IN, "Vector"_ustr)) {
-      create_uv_input(usd_export_context, socket, usd_material, usd_input, uvmap_name, reports);
-    }
-    return;
-  }
-
   pxr::UsdShadeShader transform2d_shader = create_usd_preview_shader(
       usd_export_context, usd_material, mapping_node);
 
@@ -824,17 +817,48 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
     rot[1] = 0.0f;
   }
 
+  /* Map the Cycles Mapping vector_type to UsdTransform2d's (S * in then rotate then translate)
+   * form. POINT is a direct passthrough. TEXTURE inverts the transform (its Cycles semantics
+   * are "where does this texture coordinate come from", i.e. inv(S) * R(-rot) * (in - T)).
+   * VECTOR and NORMAL drop the translation; NORMAL additionally normalizes, which the
+   * UsdTransform2d schema cannot express — the rotate+scale is the best-effort approximation
+   * and is strictly better than dropping the transform entirely (the prior behavior). */
+  float scale_usd[2] = {scale[0], scale[1]};
+  float trans_usd[2] = {loc[0], loc[1]};
+  float rot_usd = rot[2];
+
+  if (mapping_node->custom1 == TEXMAP_TYPE_TEXTURE) {
+    const float sx = scale[0] != 0.0f ? scale[0] : 1.0f;
+    const float sy = scale[1] != 0.0f ? scale[1] : 1.0f;
+    scale_usd[0] = 1.0f / sx;
+    scale_usd[1] = 1.0f / sy;
+    rot_usd = -rot[2];
+    /* T_usd = -inv(S) * R(-rot) * T_blender. */
+    const float c = cosf(rot_usd);
+    const float s = sinf(rot_usd);
+    const float rx = c * loc[0] - s * loc[1];
+    const float ry = s * loc[0] + c * loc[1];
+    trans_usd[0] = -scale_usd[0] * rx;
+    trans_usd[1] = -scale_usd[1] * ry;
+  }
+  else if (mapping_node->custom1 == TEXMAP_TYPE_VECTOR ||
+           mapping_node->custom1 == TEXMAP_TYPE_NORMAL)
+  {
+    trans_usd[0] = 0.0f;
+    trans_usd[1] = 0.0f;
+  }
+
   if (pxr::UsdShadeInput scale_input = transform2d_shader.CreateInput(
           usdtokens::scale, pxr::SdfValueTypeNames->Float2))
   {
-    pxr::GfVec2f scale_val(scale[0], scale[1]);
+    pxr::GfVec2f scale_val(scale_usd[0], scale_usd[1]);
     scale_input.Set(scale_val);
   }
 
   if (pxr::UsdShadeInput trans_input = transform2d_shader.CreateInput(
           usdtokens::translation, pxr::SdfValueTypeNames->Float2))
   {
-    pxr::GfVec2f trans_val(loc[0], loc[1]);
+    pxr::GfVec2f trans_val(trans_usd[0], trans_usd[1]);
     trans_input.Set(trans_val);
   }
 
@@ -842,7 +866,7 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
                                                                     pxr::SdfValueTypeNames->Float))
   {
     /* Convert to degrees. */
-    float rot_val = rot[2] * 180.0f / M_PI;
+    float rot_val = rot_usd * 180.0f / M_PI;
     rot_input.Set(rot_val);
   }
 
