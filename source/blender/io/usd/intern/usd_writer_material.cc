@@ -2088,20 +2088,40 @@ pxr::UsdShadeMaterial create_usd_material(const USDExporterContext &usd_export_c
   pxr::UsdShadeMaterial usd_material = pxr::UsdShadeMaterial::Define(usd_export_context.stage,
                                                                      usd_path);
 
-  if (usd_export_context.export_params.generate_preview_surface) {
-    create_usd_preview_surface_material(
-        usd_export_context, material, usd_material, active_uvmap_name, reports);
-  }
-  else {
-    create_usd_viewport_material(usd_export_context, material, usd_material);
-  }
-
+  /* Run MaterialX first so we can decide whether to also emit a UsdPreviewSurface arc.
+   * Karma (and every other MaterialX-capable Hydra delegate) prefers `outputs:mtlx:surface`
+   * over `outputs:surface` when both are present — the legacy dual-output authoring is
+   * dead weight in that case. See `emit_preview_surface_alongside_materialx` for the
+   * documented trade-off (USD consumers without MaterialX support lose all shading). */
+  bool materialx_authored_surface = false;
 #ifdef WITH_MATERIALX
   if (usd_export_context.export_params.generate_materialx_network) {
     create_usd_materialx_material(
         usd_export_context, usd_path, material, active_uvmap_name, usd_material);
+
+    if (pxr::UsdShadeOutput mtlx_surface = usd_material.GetSurfaceOutput(
+            pxr::TfToken("mtlx"))) {
+      pxr::SdfPathVector connections;
+      if (mtlx_surface.GetAttr().GetConnections(&connections) && !connections.empty()) {
+        materialx_authored_surface = true;
+      }
+    }
   }
 #endif
+
+  const bool skip_preview_surface =
+      materialx_authored_surface &&
+      !usd_export_context.export_params.emit_preview_surface_alongside_materialx;
+
+  if (!skip_preview_surface) {
+    if (usd_export_context.export_params.generate_preview_surface) {
+      create_usd_preview_surface_material(
+          usd_export_context, material, usd_material, active_uvmap_name, reports);
+    }
+    else {
+      create_usd_viewport_material(usd_export_context, material, usd_material);
+    }
+  }
 
   call_material_export_hooks(
       usd_export_context.stage, material, usd_material, usd_export_context.export_params, reports);

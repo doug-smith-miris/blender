@@ -88,6 +88,11 @@ def _export(filepath, materialx):
         evaluation_mode="RENDER",
         generate_preview_surface=True,
         generate_materialx_network=materialx,
+        # This success sentinel locks the *dual-output* invariant — explicitly opt back
+        # into the legacy behavior so the UsdPreviewSurface arc is still authored even
+        # when MaterialX has produced a usable `mtlx:surface`. See bite
+        # BL-MAT-MATX-SHADOWS-PREVIEWSURFACE for the rationale behind the new default.
+        emit_preview_surface_alongside_materialx=True,
         root_prim_path="/root",
     )
 
