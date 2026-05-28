@@ -5,6 +5,7 @@
 
 #include "BLI_string_ref.hh"
 
+#include <pxr/usd/usd/prim.h>
 #include <pxr/usd/usdShade/material.h>
 
 #include <string>
@@ -74,6 +75,18 @@ std::string get_tex_image_asset_filepath(Image *ima,
 std::string get_tex_image_asset_filepath(const std::string &asset_path,
                                          const std::string &stage_path,
                                          const USDExportParams &export_params);
+
+/**
+ * Copy `primvars:karma:object:rendervisibility` from `usd_material` onto `bound_prim`
+ * if the material authors it. Karma reads this primvar from the geometry prim (not the
+ * Material prim), so material-level authoring (PR #34, BL-MAT-OPACITY-LIGHTPATH-DROP)
+ * is invisible to the renderer until propagated; mesh and curves writers call this
+ * after `UsdShadeMaterialBindingAPI::Bind` so the artist's "camera-visible, no-shadow"
+ * intent reaches Karma. No-op when the material does not author the primvar or when
+ * the geom already has an authored value (avoids clobbering an explicit override).
+ */
+void propagate_karma_object_rendervisibility(const pxr::UsdShadeMaterial &usd_material,
+                                             const pxr::UsdPrim &bound_prim);
 
 }  // namespace io::usd
 }  // namespace blender
