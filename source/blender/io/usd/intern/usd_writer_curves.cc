@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <algorithm>
 #include <cstdint>
 #include <numeric>
 
@@ -10,6 +11,7 @@
 #include <pxr/usd/usdGeom/nurbsCurves.h>
 #include <pxr/usd/usdGeom/primvar.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdGeom/subset.h>
 #include <pxr/usd/usdGeom/tokens.h>
 #include <pxr/usd/usdShade/material.h>
 #include <pxr/usd/usdShade/materialBindingAPI.h>
@@ -21,6 +23,8 @@
 
 #include "BLI_array_utils.hh"
 #include "BLI_generic_virtual_array.hh"
+#include "BLI_index_range.hh"
+#include "BLI_map.hh"
 #include "BLI_set.hh"
 #include "BLI_span.hh"
 #include "BLI_virtual_array.hh"
@@ -34,6 +38,8 @@
 #include "BKE_report.hh"
 
 #include "BLT_translation.hh"
+
+#include "DEG_depsgraph_query.hh"
 
 #include "DNA_curve_types.h"
 #include "DNA_material_types.h"
@@ -682,7 +688,7 @@ void USDCurvesWriter::do_write(HierarchyContext &context)
   this->set_writer_attributes(
       *usd_curves, verts, control_point_counts, widths, time, interpolation);
 
-  this->assign_materials(context, *usd_curves);
+  this->assign_materials(context, curves, *usd_curves);
 
   /* TODO: We cannot write custom primvars for cyclic NURBS curves at the moment. */
   if (!is_cyclic || (is_cyclic && curve_type != CURVE_TYPE_NURBS)) {
@@ -700,37 +706,116 @@ void USDCurvesWriter::do_write(HierarchyContext &context)
 }
 
 void USDCurvesWriter::assign_materials(const HierarchyContext &context,
+                                       const bke::CurvesGeometry &curves,
                                        const pxr::UsdGeomCurves &usd_curves)
 {
-  if (context.object->totcol == 0) {
+  /* Geometry Nodes networks frequently assign materials directly to the *evaluated* curve data
+   * (e.g. the brushstroke-tools "surface_fill"/"Set Material" graphs that drive swarmfish's
+   * painterly fins and creature_trail FX). In that case the realized Curves data carries the
+   * materials while the Object's own slot count (`Object::totcol`) stays at 0, so the previous
+   * lookup via `Object::totcol` + `BKE_object_material_get` silently dropped them. The eval-aware
+   * material API consults the evaluated object *data* (see BKE_object_material_get_eval), matching
+   * how the renderer resolves materials, so GN-driven curve carriers keep their bindings. */
+  /* The original (pre-evaluation) Object retains the material slots the artist assigned in the
+   * .blend even when Geometry Nodes evaluation replaces the Curves data block with a realized one
+   * that has dropped them (or left the slot's material pointer null). We consult it as a fallback
+   * so GN-driven curve carriers such as swarmfish's `creature-BS` brushstrokes keep their
+   * material instead of being silently dropped. */
+  Object *orig_object = DEG_get_original(context.object);
+  const int eval_count = BKE_object_material_count_eval(context.object);
+  const int orig_count = orig_object ? orig_object->totcol : 0;
+  const int totcol = std::max(eval_count, orig_count);
+  if (totcol == 0) {
+    /* Blender defaults to double-sided, but USD to single-sided. */
+    usd_curves.CreateDoubleSidedAttr(pxr::VtValue(true));
     return;
   }
 
-  bool curve_material_bound = false;
-  for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
-    Material *material = BKE_object_material_get(context.object, mat_num + 1);
+  /* Resolve a material slot (1-based), preferring the evaluated material (it reflects GN "Set
+   * Material" assignments) and falling back to the original object's authored slot. */
+  auto resolve_material = [&](const int slot_zero_based) -> Material * {
+    Material *material = nullptr;
+    if (slot_zero_based < eval_count) {
+      material = BKE_object_material_get_eval(context.object, slot_zero_based + 1);
+    }
+    if (material == nullptr && orig_object != nullptr && slot_zero_based < orig_count) {
+      material = BKE_object_material_get(orig_object, slot_zero_based + 1);
+    }
+    return material;
+  };
+
+  pxr::UsdPrim curve_prim = usd_curves.GetPrim();
+  pxr::UsdShadeMaterialBindingAPI api(curve_prim);
+
+  /* Whole-prim binding: bind the first non-empty slot to the entire curve prim. Renderers that do
+   * not honor per-curve geometry subsets (and the Hydra GL viewport) still get a sensible
+   * material, mirroring USDGenericMeshWriter::assign_materials. */
+  Material *first_material = nullptr;
+  for (int mat_num = 0; mat_num < totcol; mat_num++) {
+    if (Material *m = resolve_material(mat_num)) {
+      first_material = m;
+      break;
+    }
+  }
+
+  if (first_material == nullptr) {
+    usd_curves.CreateDoubleSidedAttr(pxr::VtValue(true));
+    return;
+  }
+
+  pxr::UsdShadeMaterial first_usd_material = ensure_usd_material(context, first_material);
+  api.Bind(first_usd_material);
+  pxr::UsdShadeMaterialBindingAPI::Apply(curve_prim);
+
+  /* USD seems to support neither per-material nor per-face-group double-sidedness, so we just
+   * use the flag from the first non-empty material slot. */
+  usd_curves.CreateDoubleSidedAttr(
+      pxr::VtValue((first_material->blend_flag & MA_BL_CULL_BACKFACE) == 0));
+
+  /* Per-curve material assignment: Geometry Nodes "Set Material" writes a curve-domain
+   * `material_index` attribute on the realized Curves. When more than one material is actually in
+   * use, author one UsdGeomSubset (family=materialBind, elementType=curve) per material so the
+   * per-curve look survives the round-trip instead of collapsing every curve to slot 0. This
+   * mirrors the GeomSubset emission in USDGenericMeshWriter::assign_materials. */
+  const int curves_num = curves.curves_num();
+  if (curves_num == 0) {
+    return;
+  }
+
+  const bke::AttributeAccessor attributes = curves.attributes();
+  const VArray<int> material_indices = *attributes.lookup_or_default<int>(
+      "material_index", bke::AttrDomain::Curve, 0);
+  if (material_indices.is_single()) {
+    /* Every curve shares one slot - the whole-prim binding above already covers it. */
+    return;
+  }
+
+  Map<int, pxr::VtIntArray> curves_by_slot;
+  for (const int i_curve : IndexRange(curves_num)) {
+    const int slot = material_indices[i_curve];
+    if (slot < 0 || slot >= totcol) {
+      continue;
+    }
+    curves_by_slot.lookup_or_add_default(slot).push_back(i_curve);
+  }
+  if (curves_by_slot.size() < 2) {
+    return;
+  }
+
+  static const pxr::TfToken curve_element_type("curve");
+  for (const auto item : curves_by_slot.items()) {
+    Material *material = resolve_material(item.key);
     if (material == nullptr) {
       continue;
     }
-
-    pxr::UsdPrim curve_prim = usd_curves.GetPrim();
-    pxr::UsdShadeMaterialBindingAPI api = pxr::UsdShadeMaterialBindingAPI(curve_prim);
     pxr::UsdShadeMaterial usd_material = ensure_usd_material(context, material);
-    api.Bind(usd_material);
-    pxr::UsdShadeMaterialBindingAPI::Apply(curve_prim);
-
-    /* USD seems to support neither per-material nor per-face-group double-sidedness, so we just
-     * use the flag from the first non-empty material slot. */
-    usd_curves.CreateDoubleSidedAttr(
-        pxr::VtValue((material->blend_flag & MA_BL_CULL_BACKFACE) == 0));
-
-    curve_material_bound = true;
-    break;
-  }
-
-  if (!curve_material_bound) {
-    /* Blender defaults to double-sided, but USD to single-sided. */
-    usd_curves.CreateDoubleSidedAttr(pxr::VtValue(true));
+    const pxr::TfToken subset_name = usd_material.GetPath().GetNameToken();
+    pxr::UsdGeomSubset usd_subset = api.CreateMaterialBindSubset(
+        subset_name, item.value, curve_element_type);
+    pxr::UsdPrim subset_prim = usd_subset.GetPrim();
+    pxr::UsdShadeMaterialBindingAPI subset_api(subset_prim);
+    subset_api.Bind(usd_material);
+    pxr::UsdShadeMaterialBindingAPI::Apply(subset_prim);
   }
 }
 

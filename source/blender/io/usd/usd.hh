@@ -148,6 +148,14 @@ struct USDExportParams {
 
   bool generate_preview_surface = true;
   bool generate_materialx_network = true;
+  /* When MaterialX is also generated and authors a valid surface output, by default the
+   * UsdPreviewSurface fallback is skipped — Karma and other MaterialX-capable renderers
+   * always prefer the `mtlx:surface` arc, so the preview-surface network is dead weight
+   * (doubles validator surface area, doubles export cost, hides MaterialX-only breakage).
+   * Set this to true to opt back into the legacy dual-output behavior — at the cost of
+   * USD consumers that don't read MaterialX (older Hydra Storm, some Omniverse builds)
+   * losing all shading otherwise. */
+  bool emit_preview_surface_alongside_materialx = false;
   bool export_textures = false;
   bool overwrite_textures = true;
   bool relative_paths = true;
