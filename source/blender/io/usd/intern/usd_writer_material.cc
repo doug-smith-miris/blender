@@ -465,14 +465,38 @@ static void process_inputs(const USDExporterContext &usd_export_context,
              * 0.0): the body is in fact fully visible to the camera. Resolve a
              * linked, unrepresentable opacity to the fully-opaque default. */
             if (sock.link) {
+              const bool is_visibility_cutout = opacity_socket_drives_visibility_cutout(&sock);
               CLOG_WARN(&LOG,
                         "Opacity input '%s' is driven by an unrepresentable shader graph%s; "
                         "authoring opacity = 1.0 (opaque) rather than collapsing the chain.",
                         sock.name,
-                        opacity_socket_drives_visibility_cutout(&sock) ?
+                        is_visibility_cutout ?
                             " (Light Path / Transparent BSDF visibility cutout)" :
                             "");
               create_input(shader, input_spec, 1.0f, input_scale);
+
+              /* BL-MAT-OPACITY-LIGHTPATH-DROP: opacity = 1.0 keeps the surface
+               * visible to the camera (the artist's intent), but a Light Path /
+               * Transparent BSDF cutout *also* encodes "do not contribute to
+               * secondary rays" -- most commonly: do not cast a shadow. A bare
+               * opacity = 1 throws that selectivity away and the surface starts
+               * casting solid shadows it never cast under Cycles' Light-Path
+               * evaluation (critter_tongue's tongue interior, painted to be
+               * camera-visible only, otherwise drops a solid silhouette onto
+               * critter_body). Author a Karma-side visibility hint on the bound
+               * Material that excludes shadow rays so consumers honouring the
+               * Karma object-visibility primvar preserve the camera-visibility
+               * intent. The opacity = 1.0 fallback above is unchanged, so the
+               * PR #27 invariant for swarmfish creature_body still holds; delegates
+               * that do not recognise this primvar simply ignore it. */
+              if (is_visibility_cutout) {
+                pxr::UsdAttribute karma_vis = usd_material.GetPrim().CreateAttribute(
+                    pxr::TfToken("primvars:karma:object:rendervisibility"),
+                    pxr::SdfValueTypeNames->String,
+                    /*custom=*/false,
+                    pxr::SdfVariabilityUniform);
+                karma_vis.Set(std::string("camera,reflect,refract,diffuse,glossy,volume"));
+              }
             }
             else {
               /* Unlinked constant. Alpha maps directly to opacity (alpha = 1 ->
