@@ -51,37 +51,159 @@ def _is_signal_carrier(node: bpy.types.Node, socket_name: str) -> bool:
     return bool(pred and pred(socket_name))
 
 
+def _find_principled_recursive(tree: "bpy.types.NodeTree") -> Optional["bpy.types.Node"]:
+    """Find a Principled BSDF anywhere in `tree`, including inside nested
+    ShaderNodeGroup sub-trees. Mirrors the C++ find_node_of_type_recursive
+    helper in usd_writer_material.cc that PR #18 added so empty Material
+    prims don't get emitted when the BSDF is wrapped in a group."""
+    if tree is None:
+        return None
+    for n in tree.nodes:
+        if n.bl_idname == "ShaderNodeBsdfPrincipled":
+            return n
+    for n in tree.nodes:
+        if n.bl_idname == "ShaderNodeGroup" and getattr(n, "node_tree", None) is not None:
+            found = _find_principled_recursive(n.node_tree)
+            if found is not None:
+                return found
+    return None
+
+
+def _outer_surface_has_lightpath_cutout(material: bpy.types.Material) -> bool:
+    """Walk back from the active Material Output's Surface socket and
+    return True if a Mix Shader fed by a Light Path / Transparent BSDF
+    sits between the output and the inner BSDF — that's body_mouth_bag's
+    visibility cutout, which Cycles renders but UsdPreviewSurface cannot
+    losslessly express, so the diffuse is best captured via a bake."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return False
+    out = None
+    for n in material.node_tree.nodes:
+        if n.bl_idname == "ShaderNodeOutputMaterial" and n.is_active_output:
+            out = n
+            break
+    if out is None:
+        for n in material.node_tree.nodes:
+            if n.bl_idname == "ShaderNodeOutputMaterial":
+                out = n
+                break
+    if out is None:
+        return False
+    surf = out.inputs.get("Surface")
+    if surf is None or not surf.is_linked:
+        return False
+
+    visited: set["bpy.types.Node"] = set()
+
+    def walk(socket: "bpy.types.NodeSocket", depth: int = 0) -> bool:
+        if depth > 8 or not socket.is_linked:
+            return False
+        node = socket.links[0].from_node
+        if node in visited:
+            return False
+        visited.add(node)
+        bl = node.bl_idname
+        if bl == "ShaderNodeMixShader":
+            # Light-Path-driven Mix Shader = cutout pattern.
+            fac = node.inputs.get("Fac") or (node.inputs[0] if node.inputs else None)
+            if fac is not None and fac.is_linked:
+                src = fac.links[0].from_node
+                if src.bl_idname == "ShaderNodeLightPath":
+                    return True
+            # Otherwise keep descending into both shader inputs.
+        if bl == "NodeReroute":
+            return walk(node.inputs[0], depth + 1)
+        for inp in node.inputs:
+            if inp.type == "SHADER" and walk(inp, depth + 1):
+                return True
+        return False
+
+    return walk(surf)
+
+
 def _base_color_chain_is_unrepresentable(material: bpy.types.Material) -> bool:
     """True if the Principled BSDF Base Color is linked through a node
-    that the allowlist refuses to descend through. False if Base Color
-    is unlinked, or linked directly to a representable terminal (e.g.
-    Image Texture). Recurses across signal-carrier nodes."""
+    that the allowlist refuses to descend through, OR if the outer
+    surface network wraps the BSDF in a Light-Path/Transparent-BSDF Mix
+    Shader cutout (body_mouth_bag). False if Base Color is unlinked, or
+    linked directly to a representable terminal (e.g. Image Texture).
+    Recurses across signal-carrier nodes AND across ShaderNodeGroup
+    boundaries (group input/output)."""
     if not material or not material.use_nodes or not material.node_tree:
         return False
 
-    bsdf = None
-    for n in material.node_tree.nodes:
-        if n.bl_idname == "ShaderNodeBsdfPrincipled":
-            bsdf = n
-            break
+    # Recurse into nested ShaderNodeGroups to find the Principled BSDF.
+    bsdf = _find_principled_recursive(material.node_tree)
     if bsdf is None:
         return False
 
     base = bsdf.inputs.get("Base Color")
-    if base is None or not base.is_linked:
+    if base is None:
         return False
 
+    # If the outer-material surface wraps everything in a Light-Path
+    # cutout (body_mouth_bag-style) we want to bake regardless of how
+    # the inner Base Color is wired -- Cycles renders the cutout as
+    # visible-where-camera and the PreviewSurface fallback can't.
+    if _outer_surface_has_lightpath_cutout(material):
+        return True
+
+    if not base.is_linked:
+        return False
+
+    # `group_stack` lets the walk ascend back through GROUP_INPUT to the
+    # caller's outer socket, mirroring traverse_channel in PR #10/#15.
     visited: set[bpy.types.Node] = set()
 
-    def walk(socket: bpy.types.NodeSocket) -> bool:
+    def walk(socket: bpy.types.NodeSocket, group_stack: list) -> bool:
         # Returns True if upstream chain hits an unrepresentable modifier.
         if not socket.is_linked:
             return False
         link = socket.links[0]
         upstream = link.from_node
+        from_sock = link.from_socket
         if upstream in visited:
             return False
         visited.add(upstream)
+
+        # Descend INTO a ShaderNodeGroup: find the matching Group Output
+        # in the inner tree and walk that internal input.
+        if upstream.bl_idname == "ShaderNodeGroup" and getattr(upstream, "node_tree", None):
+            inner = upstream.node_tree
+            output_node = None
+            for n in inner.nodes:
+                if n.bl_idname == "NodeGroupOutput" and getattr(n, "is_active_output", True):
+                    output_node = n
+                    break
+            if output_node is None:
+                for n in inner.nodes:
+                    if n.bl_idname == "NodeGroupOutput":
+                        output_node = n
+                        break
+            if output_node is None:
+                return False
+            inner_socket = None
+            for inp in output_node.inputs:
+                if inp.identifier == from_sock.identifier or inp.name == from_sock.name:
+                    inner_socket = inp
+                    break
+            if inner_socket is None:
+                return False
+            return walk(inner_socket, group_stack + [upstream])
+
+        # Ascend OUT of a ShaderNodeGroup via NodeGroupInput.
+        if upstream.bl_idname == "NodeGroupInput":
+            if not group_stack:
+                return False
+            outer_group = group_stack[-1]
+            outer_socket = None
+            for inp in outer_group.inputs:
+                if inp.identifier == from_sock.identifier or inp.name == from_sock.name:
+                    outer_socket = inp
+                    break
+            if outer_socket is None:
+                return False
+            return walk(outer_socket, group_stack[:-1])
 
         # Representable terminals halt cleanly (no bake required).
         if upstream.bl_idname in (
@@ -99,12 +221,12 @@ def _base_color_chain_is_unrepresentable(material: bpy.types.Material) -> bool:
             return True
         for inp in upstream.inputs:
             if carrier_pred(inp.name):
-                if walk(inp):
+                if walk(inp, group_stack):
                     return True
         # Carrier with no signal-carrier path through it -- still flat.
         return False
 
-    return walk(base)
+    return walk(base, [])
 
 
 def find_unrepresentable_materials(scene: bpy.types.Scene) -> list[bpy.types.Material]:
@@ -325,6 +447,117 @@ def rewire_diffuse_color(
     return True
 
 
+def rewire_materialx_base_color(
+    stage_path: str,
+    material_name: str,
+    baked_image_relpath: str,
+    uv_varname: str = "st",
+) -> bool:
+    """Make the MaterialX surface arc of `material_name` faithful to the
+    baked diffuse texture. Critter's body_purple / body_mouth_bag emit
+    `mtlx:surface ← node_137 (ND_surface)` with a complex `bsdf`/`edf`
+    subgraph that Karma renders to either an under-saturated or broken
+    color (the painterly chain has Light-Path / Mix Shader / vertex-color
+    pieces that don't survive MaterialX inlining cleanly). Replace the
+    `mtlx:surface` connection with a freshly minted
+    ND_open_pbr_surface_surfaceshader whose `base_color` reads the baked
+    PNG via UsdUVTexture → UsdPrimvarReader_float2, so MaterialX-consuming
+    renderers (Karma, Storm with mtlx) see the same painterly diffuse
+    that Cycles produced. If the existing mtlx surface is already
+    ND_open_pbr_surface_surfaceshader (e.g. critter_tongue), just rewire
+    its base_color input in place. Returns True if the stage was edited
+    and saved."""
+    Usd, UsdGeom, UsdShade, Sdf = _import_pxr()
+
+    stage = Usd.Stage.Open(stage_path)
+    if stage is None:
+        return False
+
+    candidates = {material_name}
+    sanitized = material_name.replace("-", "_").replace(".", "_").replace(" ", "_")
+    candidates.add(sanitized)
+
+    target_mat = None
+    for prim in stage.Traverse():
+        if prim.IsA(UsdShade.Material) and prim.GetName() in candidates:
+            target_mat = UsdShade.Material(prim)
+            break
+    if target_mat is None:
+        return False
+
+    mtlx_token = "mtlx"
+    mtlx_out = target_mat.GetSurfaceOutput(mtlx_token)
+    if not mtlx_out:
+        # No MaterialX surface arc on this material -- nothing to do.
+        return False
+
+    mat_path = target_mat.GetPath()
+    tex_name = "baseColor_mtlx_baked_tex"
+    pr_name = "baseColor_mtlx_baked_st"
+    tex_path = mat_path.AppendChild(tex_name)
+    pr_path = mat_path.AppendChild(pr_name)
+    # Re-create from scratch in case a prior bake left stale prims.
+    if stage.GetPrimAtPath(tex_path):
+        stage.RemovePrim(tex_path)
+    if stage.GetPrimAtPath(pr_path):
+        stage.RemovePrim(pr_path)
+
+    # MaterialX UsdMtlxRead consumers expect the texture stack to be
+    # ND_image_color3 + ND_geompropvalue_vector2 to round-trip through
+    # the same `mtlx` shader render context that drives `node_137`.
+    pr_shader = UsdShade.Shader.Define(stage, pr_path)
+    pr_shader.CreateIdAttr("ND_geompropvalue_vector2")
+    pr_shader.CreateInput("geomprop", Sdf.ValueTypeNames.String).Set(uv_varname)
+    pr_out = pr_shader.CreateOutput("out", Sdf.ValueTypeNames.Float2)
+
+    tex_shader = UsdShade.Shader.Define(stage, tex_path)
+    tex_shader.CreateIdAttr("ND_image_color3")
+    tex_shader.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(
+        Sdf.AssetPath(baked_image_relpath)
+    )
+    tex_shader.CreateInput("texcoord", Sdf.ValueTypeNames.Float2).ConnectToSource(pr_out)
+    tex_out = tex_shader.CreateOutput("out", Sdf.ValueTypeNames.Color3f)
+
+    # Is the existing mtlx surface already ND_open_pbr_surface_surfaceshader?
+    surf_shader = None
+    if mtlx_out.HasConnectedSource():
+        src = mtlx_out.GetConnectedSource()
+        if src and src[0] is not None:
+            cand = UsdShade.Shader(src[0].GetPrim())
+            id_val = cand.GetIdAttr().Get()
+            if id_val == "ND_open_pbr_surface_surfaceshader":
+                surf_shader = cand
+
+    if surf_shader is not None:
+        # In-place rewire of base_color.
+        bc_in = surf_shader.GetInput("base_color")
+        if bc_in is None:
+            bc_in = surf_shader.CreateInput("base_color", Sdf.ValueTypeNames.Color3f)
+        bc_in.DisconnectSource()
+        bc_in.ConnectToSource(tex_out)
+    else:
+        # Replace the surface arc with a fresh open_pbr_surface that
+        # carries our baked diffuse. The complex prior graph (ND_surface
+        # with custom bsdf/edf wiring) renders to a non-faithful result
+        # under MaterialX consumers; the bake captures Cycles' final
+        # painterly diffuse, so a clean open_pbr_surface base_color is
+        # the most faithful expression of artist intent.
+        new_name = "baseColor_mtlx_baked_surface"
+        new_path = mat_path.AppendChild(new_name)
+        if stage.GetPrimAtPath(new_path):
+            stage.RemovePrim(new_path)
+        new_surf = UsdShade.Shader.Define(stage, new_path)
+        new_surf.CreateIdAttr("ND_open_pbr_surface_surfaceshader")
+        bc_in = new_surf.CreateInput("base_color", Sdf.ValueTypeNames.Color3f)
+        bc_in.ConnectToSource(tex_out)
+        new_out = new_surf.CreateOutput("out", Sdf.ValueTypeNames.Token)
+        mtlx_out.DisconnectSource()
+        mtlx_out.ConnectToSource(new_out)
+
+    stage.GetRootLayer().Save()
+    return True
+
+
 # --- Public driver ----------------------------------------------------------
 def bake_and_export(filepath: str, only_materials: Optional[Iterable[str]] = None,
                     bake_resolution: int = 1024, **wm_usd_export_kwargs) -> dict:
@@ -371,14 +604,24 @@ def bake_and_export(filepath: str, only_materials: Optional[Iterable[str]] = Non
     # Run the USD export.
     bpy.ops.wm.usd_export(filepath=filepath, **wm_usd_export_kwargs)
 
-    # Rewire the USD.
+    # Rewire the USD. Try both the UsdPreviewSurface (diffuseColor) and
+    # the MaterialX surface (open_pbr_surface.base_color) — the former
+    # may be absent under emit_preview_surface_alongside_materialx=False
+    # (PR #35's default suppresses dual arcs when MaterialX is present);
+    # the latter is what Karma reads when MaterialX is the active arc.
     for mat_name, png in list(baked.items()):
         relpath = os.path.relpath(png, out_dir)
-        ok = rewire_diffuse_color(filepath, mat_name, relpath)
-        if not ok:
-            print(f"[bake-unrep-albedo] rewire failed for {mat_name}; removing from result")
+        preview_ok = rewire_diffuse_color(filepath, mat_name, relpath)
+        mtlx_ok = rewire_materialx_base_color(filepath, mat_name, relpath)
+        if not preview_ok and not mtlx_ok:
+            print(f"[bake-unrep-albedo] rewire failed for {mat_name} (neither preview nor mtlx); removing")
             baked.pop(mat_name, None)
         else:
-            print(f"[bake-unrep-albedo] rewired {mat_name}.diffuseColor -> {relpath}")
+            tag = []
+            if preview_ok:
+                tag.append("UsdPreviewSurface.diffuseColor")
+            if mtlx_ok:
+                tag.append("mtlx.open_pbr_surface.base_color")
+            print(f"[bake-unrep-albedo] rewired {mat_name} -> {relpath} via {', '.join(tag)}")
 
     return baked
