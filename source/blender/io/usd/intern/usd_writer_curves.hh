@@ -26,7 +26,9 @@ class USDCurvesWriter final : public USDAbstractWriter {
 
  protected:
   void do_write(HierarchyContext &context) override;
-  void assign_materials(const HierarchyContext &context, const pxr::UsdGeomCurves &usd_curves);
+  void assign_materials(const HierarchyContext &context,
+                        const bke::CurvesGeometry &curves,
+                        const pxr::UsdGeomCurves &usd_curves);
 
  private:
   int8_t first_frame_curve_type = -1;

@@ -344,6 +344,8 @@ static wmOperatorStatus wm_usd_export_exec(bContext *C, wmOperator *op)
 
   params.generate_preview_surface = RNA_boolean_get(op->ptr, "generate_preview_surface");
   params.generate_materialx_network = RNA_boolean_get(op->ptr, "generate_materialx_network");
+  params.emit_preview_surface_alongside_materialx = RNA_boolean_get(
+      op->ptr, "emit_preview_surface_alongside_materialx");
   params.overwrite_textures = RNA_boolean_get(op->ptr, "overwrite_textures");
   params.relative_paths = RNA_boolean_get(op->ptr, "relative_paths");
   params.export_textures = export_textures;
@@ -688,6 +690,15 @@ void WM_OT_usd_export(wmOperatorType *ot)
                   false,
                   "MaterialX Network",
                   "Generate a MaterialX network representation of the materials");
+
+  RNA_def_boolean(ot->srna,
+                  "emit_preview_surface_alongside_materialx",
+                  false,
+                  "Emit Preview Surface Alongside MaterialX",
+                  "When MaterialX is also generated, also author the UsdPreviewSurface fallback. "
+                  "Off by default — MaterialX-capable Hydra delegates (Karma) always prefer the "
+                  "`mtlx:surface` arc, so authoring both is dead weight. Enable only for "
+                  "consumers that don't read MaterialX (older Hydra Storm, some Omniverse builds)");
 
   RNA_def_boolean(
       ot->srna,
