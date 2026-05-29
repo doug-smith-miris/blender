@@ -26,6 +26,7 @@
 #include "BLI_map.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_set.hh"
+#include "BLI_span.hh"
 #include "BLI_string.h"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utils.hh"
@@ -43,6 +44,7 @@
 #ifdef WITH_MATERIALX
 #  include "shader/materialx/material.h"
 #  include <pxr/usd/sdf/copyUtils.h>
+#  include <pxr/usd/usd/primRange.h>
 #  include <pxr/usd/usdMtlx/materialXConfigAPI.h>
 #  include <pxr/usd/usdMtlx/reader.h>
 #endif
@@ -176,6 +178,35 @@ static void set_scale_bias(pxr::UsdShadeShader &usd_shader,
     bias_attr = usd_shader.CreateInput(usdtokens::bias, pxr::SdfValueTypeNames->Float4);
   }
   bias_attr.Set(bias);
+}
+
+/* Returns true if `input` is driven -- possibly through Reroute / Math / Mix
+ * intermediates -- by a Light Path or Transparent BSDF node, i.e. the artist
+ * built a render-visibility "cutout" (the swarmfish `creature_body` Alpha is
+ * `Mix(fac = Light Path > Is Camera Ray)`) rather than a literal per-pixel
+ * surface transparency.
+ *
+ * Such a cutout has no faithful UsdPreviewSurface representation: the surface
+ * is fully visible to the camera and the Light Path expression only suppresses
+ * it for *secondary* rays. Recognising it lets the writer resolve opacity to
+ * the fully-opaque default rather than collapse the chain to the linked
+ * socket's stale `default_value` (which for creature_body is 0.0, otherwise
+ * exporting `opacity = 0` and rendering the body invisible in Karma). */
+static bool opacity_socket_drives_visibility_cutout(bNodeSocket *input, int depth = 0)
+{
+  if (!input || !input->link || !input->link->fromnode || depth > 32) {
+    return false;
+  }
+  const bNode *node = input->link->fromnode;
+  if (node->type_legacy == SH_NODE_LIGHT_PATH || node->type_legacy == SH_NODE_BSDF_TRANSPARENT) {
+    return true;
+  }
+  for (bNodeSocket &sock : input->link->fromnode->inputs) {
+    if (opacity_socket_drives_visibility_cutout(&sock, depth + 1)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void process_inputs(const USDExporterContext &usd_export_context,
@@ -421,9 +452,78 @@ static void process_inputs(const USDExporterContext &usd_export_context,
     if (input_spec.set_default_value) {
       switch (sock.type) {
         case SOCK_FLOAT: {
-          const bool is_inverted = input_spec.input_name == usdtokens::opacity;
-          const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
-          create_input(shader, input_spec, is_inverted ? (1.0f - val) : val, input_scale);
+          if (input_spec.input_name == usdtokens::opacity) {
+            /* Both Principled "Alpha" and "Transmission Weight" map to
+             * UsdPreviewSurface opacity. This default-constant fallback is also
+             * reached when the socket is *linked* to a shader-graph expression
+             * the writer could not reduce to a representable texture / attribute
+             * source. For a linked socket the stored `default_value` is stale and
+             * meaningless, so emitting (or inverting) it silently collapses the
+             * surface to `opacity = 0` -- fully invisible. This is exactly what
+             * happens for an Alpha cutout built from Light Path / Transparent
+             * BSDF (swarmfish creature_body, whose leftover Alpha default is
+             * 0.0): the body is in fact fully visible to the camera. Resolve a
+             * linked, unrepresentable opacity to the fully-opaque default. */
+            if (sock.link) {
+              const bool is_visibility_cutout = opacity_socket_drives_visibility_cutout(&sock);
+              CLOG_WARN(&LOG,
+                        "Opacity input '%s' is driven by an unrepresentable shader graph%s; "
+                        "authoring opacity = 1.0 (opaque) rather than collapsing the chain.",
+                        sock.name,
+                        is_visibility_cutout ?
+                            " (Light Path / Transparent BSDF visibility cutout)" :
+                            "");
+              create_input(shader, input_spec, 1.0f, input_scale);
+
+              /* BL-MAT-OPACITY-LIGHTPATH-DROP: opacity = 1.0 keeps the surface
+               * visible to the camera (the artist's intent), but a Light Path /
+               * Transparent BSDF cutout *also* encodes "do not contribute to
+               * secondary rays" -- most commonly: do not cast a shadow. A bare
+               * opacity = 1 throws that selectivity away and the surface starts
+               * casting solid shadows it never cast under Cycles' Light-Path
+               * evaluation (critter_tongue's tongue interior, painted to be
+               * camera-visible only, otherwise drops a solid silhouette onto
+               * critter_body). Author a Karma-side visibility hint on the bound
+               * Material that excludes shadow rays so consumers honouring the
+               * Karma object-visibility primvar preserve the camera-visibility
+               * intent. The opacity = 1.0 fallback above is unchanged, so the
+               * PR #27 invariant for swarmfish creature_body still holds; delegates
+               * that do not recognise this primvar simply ignore it. */
+              if (is_visibility_cutout) {
+                /* Karma's `primvars:karma:object:rendervisibility` parser uses
+                 * pipe-separated ray flags with `-` prefix for exclusion (see
+                 * Houdini `BRAY_HdKarma_Geometry.ds`). Valid tokens are `*`,
+                 * `primary`, `shadow`, `reflect`, `refract`, `diffuse`, `glossy`,
+                 * `volume`. The previous comma-delimited list with the `camera`
+                 * alias parsed as "nothing recognised" and dropped the surface
+                 * from primary rays as soon as it was on the geom prim (Karma
+                 * silently ignored it on the Material prim, masking the bug).
+                 * `-shadow` is the documented "Invisible to shadow rays" preset:
+                 * visible to camera + reflect + refract + diffuse + glossy +
+                 * volume, but cast no shadow -- exactly the artist's Light-Path
+                 * cutout intent. */
+                pxr::UsdAttribute karma_vis = usd_material.GetPrim().CreateAttribute(
+                    pxr::TfToken("primvars:karma:object:rendervisibility"),
+                    pxr::SdfValueTypeNames->String,
+                    /*custom=*/false,
+                    pxr::SdfVariabilityUniform);
+                karma_vis.Set(std::string("-shadow"));
+              }
+            }
+            else {
+              /* Unlinked constant. Alpha maps directly to opacity (alpha = 1 ->
+               * opaque); Transmission Weight is the complement (transmission =
+               * 1 -> fully transmissive -> opacity = 0). */
+              const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
+              const bool is_transmission = STREQ(sock.name, "Transmission Weight");
+              create_input(
+                  shader, input_spec, is_transmission ? (1.0f - val) : val, input_scale);
+            }
+          }
+          else {
+            const float val = sock.default_value_typed<bNodeSocketValueFloat>()->value;
+            create_input(shader, input_spec, val, input_scale);
+          }
         } break;
         case SOCK_VECTOR: {
           const float *val = sock.default_value_typed<bNodeSocketValueVector>()->value;
@@ -696,13 +796,6 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
     return;
   }
 
-  if (mapping_node->custom1 != TEXMAP_TYPE_POINT) {
-    if (bNodeSocket *socket = bke::node_find_socket(*mapping_node, SOCK_IN, "Vector"_ustr)) {
-      create_uv_input(usd_export_context, socket, usd_material, usd_input, uvmap_name, reports);
-    }
-    return;
-  }
-
   pxr::UsdShadeShader transform2d_shader = create_usd_preview_shader(
       usd_export_context, usd_material, mapping_node);
 
@@ -736,17 +829,48 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
     rot[1] = 0.0f;
   }
 
+  /* Map the Cycles Mapping vector_type to UsdTransform2d's (S * in then rotate then translate)
+   * form. POINT is a direct passthrough. TEXTURE inverts the transform (its Cycles semantics
+   * are "where does this texture coordinate come from", i.e. inv(S) * R(-rot) * (in - T)).
+   * VECTOR and NORMAL drop the translation; NORMAL additionally normalizes, which the
+   * UsdTransform2d schema cannot express — the rotate+scale is the best-effort approximation
+   * and is strictly better than dropping the transform entirely (the prior behavior). */
+  float scale_usd[2] = {scale[0], scale[1]};
+  float trans_usd[2] = {loc[0], loc[1]};
+  float rot_usd = rot[2];
+
+  if (mapping_node->custom1 == TEXMAP_TYPE_TEXTURE) {
+    const float sx = scale[0] != 0.0f ? scale[0] : 1.0f;
+    const float sy = scale[1] != 0.0f ? scale[1] : 1.0f;
+    scale_usd[0] = 1.0f / sx;
+    scale_usd[1] = 1.0f / sy;
+    rot_usd = -rot[2];
+    /* T_usd = -inv(S) * R(-rot) * T_blender. */
+    const float c = cosf(rot_usd);
+    const float s = sinf(rot_usd);
+    const float rx = c * loc[0] - s * loc[1];
+    const float ry = s * loc[0] + c * loc[1];
+    trans_usd[0] = -scale_usd[0] * rx;
+    trans_usd[1] = -scale_usd[1] * ry;
+  }
+  else if (mapping_node->custom1 == TEXMAP_TYPE_VECTOR ||
+           mapping_node->custom1 == TEXMAP_TYPE_NORMAL)
+  {
+    trans_usd[0] = 0.0f;
+    trans_usd[1] = 0.0f;
+  }
+
   if (pxr::UsdShadeInput scale_input = transform2d_shader.CreateInput(
           usdtokens::scale, pxr::SdfValueTypeNames->Float2))
   {
-    pxr::GfVec2f scale_val(scale[0], scale[1]);
+    pxr::GfVec2f scale_val(scale_usd[0], scale_usd[1]);
     scale_input.Set(scale_val);
   }
 
   if (pxr::UsdShadeInput trans_input = transform2d_shader.CreateInput(
           usdtokens::translation, pxr::SdfValueTypeNames->Float2))
   {
-    pxr::GfVec2f trans_val(loc[0], loc[1]);
+    pxr::GfVec2f trans_val(trans_usd[0], trans_usd[1]);
     trans_input.Set(trans_val);
   }
 
@@ -754,7 +878,7 @@ static void create_transform2d_shader(const USDExporterContext &usd_export_conte
                                                                     pxr::SdfValueTypeNames->Float))
   {
     /* Convert to degrees. */
-    float rot_val = rot[2] * 180.0f / M_PI;
+    float rot_val = rot_usd * 180.0f / M_PI;
     rot_input.Set(rot_val);
   }
 
@@ -1060,12 +1184,73 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
   return wrap;
 }
 
-/* Search the upstream node links connected to the given socket and return the first occurrence
- * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null. */
+/* Returns true if `sock_name` (the Blender display name of an input socket)
+ * is one of the signal-carrying inputs we are willing to descend into when
+ * walking upstream from `linked_node` looking for `target_type`. */
+static bool is_signal_carrying_input(const bNode *linked_node, const char *sock_name)
+{
+  if (!linked_node || !sock_name) {
+    return false;
+  }
+  switch (linked_node->type_legacy) {
+    /* Reroute has a single (unnamed) input that always carries the signal. */
+    case NODE_REROUTE:
+      return true;
+    /* Texture-on-color chains: the Color input carries the upstream image. */
+    case SH_NODE_NORMAL_MAP:
+    case SH_NODE_SEPARATE_COLOR:
+      return STREQ(sock_name, "Color");
+    /* Bump / Displacement: the Height input carries the upstream texture. */
+    case SH_NODE_BUMP:
+    case SH_NODE_DISPLACEMENT:
+      return STREQ(sock_name, "Height");
+    /* Combine Color: pass through the per-channel inputs in RGB mode. */
+    case SH_NODE_COMBINE_COLOR:
+      return STREQ(sock_name, "Red") || STREQ(sock_name, "Green") || STREQ(sock_name, "Blue");
+    /* Mapping: only the Vector input carries the upstream UV/coord source. */
+    case SH_NODE_MAPPING:
+      return STREQ(sock_name, "Vector");
+    /* Math: the two Value operands carry the upstream value. */
+    case SH_NODE_MATH:
+      return STREQ(sock_name, "Value");
+    /* Vector Math: the two Vector operands carry the upstream vector. */
+    case SH_NODE_VECTOR_MATH:
+      return STREQ(sock_name, "Vector");
+    default:
+      /* Color-modifying or value-modulating intermediates we cannot represent
+       * losslessly in UsdPreviewSurface (RGB Curves, Hue/Saturation, Float
+       * Curve, Color Ramp, Mix, Map Range, Clamp, Gamma, Brightness/Contrast,
+       * Invert, ...) and unknown node types: refuse to descend. Walking
+       * through them would silently flatten the artist's intent — and worse,
+       * a deep DFS through unrelated control inputs (Hue, Saturation, Factor,
+       * Map-Range From/To-Min/Max, ColorRamp Fac) can latch onto an Image
+       * Texture from a totally different channel and attach it as the source
+       * for this input. See BL-MAT-traverse-channel-naive-dfs-wrong-input-
+       * wiring. */
+      return false;
+  }
+}
+
+/* Walks upstream from the given input socket and returns the first link
+ * whose fromnode is of `target_type`. Returns null if no such terminal can
+ * be reached following only signal-carrying inputs (see
+ * `is_signal_carrying_input`). The returned link's `fromnode` and `fromsock`
+ * are guaranteed non-null.
+ *
+ * Implementation note (BL-MAT-traverse-channel-naive-dfs-wrong-input-wiring):
+ * the prior implementation did a naive DFS through *every* input of every
+ * intermediate node, including modulator and control inputs of color-
+ * modifying nodes. That caused the BSDF's Base Color traversal to find and
+ * attach an Image Texture wired into a completely unrelated control channel
+ * (e.g. a Hue/Saturation Hue operand, a Mix Factor driven by Map Range, a
+ * ColorRamp Fac). The exported UsdPreviewSurface ended up with diffuseColor
+ * pointing at the roughness texture, normal pointing at the diffuse texture,
+ * and so on. This version restricts the descent to nodes whose signal-flow
+ * we can identify, and halts at color-modifying intermediates rather than
+ * misattributing the deeper image. */
 static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
 {
-  if (!(input->link && input->link->fromnode && input->link->fromsock)) {
+  if (!(input && input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
   }
 
@@ -1075,8 +1260,11 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
     return input->link;
   }
 
-  /* Recursively traverse the linked node's sockets. */
+  /* Recursively traverse only the signal-carrying inputs of the linked node. */
   for (bNodeSocket &sock : linked_node->inputs) {
+    if (!is_signal_carrying_input(linked_node, sock.name)) {
+      continue;
+    }
     if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
       return found_link;
     }
@@ -1085,33 +1273,57 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree.  Returns null if no instance of either type was found. */
-static bNode *find_bsdf_node(Material *material)
+/* Recursively searches a node tree -- descending into any nested node groups -- for the first
+ * node whose legacy type is one of `node_types`. Returns null if none is found.
+ *
+ * Descending into groups is required for AYON-style materials (e.g. swarmfish
+ * `creature_eyes` / `creature_pupil`) whose shader network is wrapped in a #ShaderNodeGroup
+ * that exposes only a Surface output. Such a group node is the only top-level node feeding
+ * Material Output, so a flat scan of the material's node tree never reaches the BSDF and the
+ * UsdPreviewSurface writer would emit an empty `def Material {}` prim. */
+static bNode *find_node_of_type_recursive(bNodeTree *ntree, const blender::Span<int> node_types)
 {
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
+  if (!ntree) {
+    return nullptr;
+  }
+
+  for (bNode *node : ntree->all_nodes()) {
+    if (node_types.contains(node->type_legacy)) {
       return node;
+    }
+  }
+
+  /* No match at this level: descend into node groups. */
+  for (bNode *node : ntree->all_nodes()) {
+    if (node->is_group()) {
+      if (bNode *found = find_node_of_type_recursive(reinterpret_cast<bNodeTree *>(node->id),
+                                                     node_types))
+      {
+        return found;
+      }
     }
   }
 
   return nullptr;
 }
 
+/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
+ * material's node tree (including inside nested node groups).  Returns null if no instance of
+ * either type was found. */
+static bNode *find_bsdf_node(Material *material)
+{
+  return find_node_of_type_recursive(material->nodetree,
+                                     {SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE});
+}
+
 /**
  * Returns the first occurrence of a scalar Displacement node found in the given
- * material's node tree. Vector Displacement is not supported in the #UsdPreviewSurface.
- * Returns null if no instance of either type was found.
+ * material's node tree (including inside nested node groups). Vector Displacement is not
+ * supported in the #UsdPreviewSurface. Returns null if no instance of either type was found.
  */
 static bNode *find_displacement_node(Material *material)
 {
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (node->type_legacy == SH_NODE_DISPLACEMENT) {
-      return node;
-    }
-  }
-
-  return nullptr;
+  return find_node_of_type_recursive(material->nodetree, {SH_NODE_DISPLACEMENT});
 }
 
 /* Creates a USD Preview Surface shader based on the given cycles node name and type. */
@@ -1574,6 +1786,109 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
   auto temp_stage = pxr::UsdStage::CreateInMemory();
   pxr::UsdMtlxRead(doc, temp_stage, pxr::SdfPath("/root"));
 
+  /* Prune phantom Shader prims and orphan shader-typed input declarations
+   * that `UsdMtlxRead` leaves behind when it can't resolve a MaterialX
+   * nodedef. Blender's MaterialX writer emits categories like
+   * `thin_film_bsdf` that the bundled USD MaterialX library doesn't
+   * recognise (typical for the Principled BSDF's iridescence component on
+   * hero assets such as mikassa). The reader then:
+   *   * skips authoring `info:id` and outputs on the unresolved node — it
+   *     stays as an input-only Shader stub;
+   *   * drops every `inputs:*.connect` that targeted that node's outputs —
+   *     but the consumer's `inputs:NAME` attribute spec is still authored
+   *     with `renderType = "BSDF"` (or similar) and no value and no
+   *     connection.
+   * Both kinds of orphan trip Karma's MaterialX shader compiler with
+   * `Error 1067: Reference to undefined variable: out_N`. Strip them so
+   * the resulting USD is internally consistent. Consumer inputs already
+   * fall back to their typed defaults; we just need to delete the dead
+   * specs. */
+  {
+    pxr::SdfPathVector phantom_shader_paths;
+    for (const pxr::UsdPrim &prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (shader.GetIdAttr().Get(&id_token) && !id_token.IsEmpty()) {
+        continue;
+      }
+      phantom_shader_paths.push_back(prim.GetPath());
+    }
+    for (const pxr::SdfPath &path : phantom_shader_paths) {
+      temp_stage->RemovePrim(path);
+    }
+
+    /* Walk surviving Shaders for shader-typed input attributes (token /
+     * BSDF / EDF / surfaceshader) whose connection the reader dropped.
+     * Remove the attribute spec entirely so the consumer simply uses its
+     * default for that input rather than authoring an empty, unresolvable
+     * reference. */
+    for (pxr::UsdPrim prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (!shader.GetIdAttr().Get(&id_token) || id_token.IsEmpty()) {
+        continue;
+      }
+      Vector<pxr::TfToken> input_names_to_erase;
+      for (const pxr::UsdShadeInput &input : shader.GetInputs()) {
+        const pxr::UsdAttribute attr = input.GetAttr();
+        if (attr.GetTypeName() != pxr::SdfValueTypeNames->Token) {
+          continue;
+        }
+        pxr::SdfPathVector connections;
+        attr.GetConnections(&connections);
+        if (!connections.empty()) {
+          continue;
+        }
+        if (attr.HasAuthoredValue()) {
+          continue;
+        }
+        input_names_to_erase.append(attr.GetName());
+      }
+      for (const pxr::TfToken &name : input_names_to_erase) {
+        prim.RemoveProperty(name);
+      }
+    }
+  }
+
+  /* Normalize the MaterialX `normalmap` nodedef name to the version-agnostic
+   * `ND_normalmap` form. UsdMtlxRead writes the MaterialX-1.39-suffixed
+   * `ND_normalmap_float` / `ND_normalmap_vector2` (the suffix is the `scale`
+   * input's type), but consumers on MaterialX 1.38 stdlibs (older Omniverse
+   * USD builds, older Hydra Storm) only know the legacy un-suffixed
+   * `ND_normalmap` nodedef name. Failing to resolve the suffixed name aborts
+   * the consumer's MaterialX network parse — on Omniverse this hits the
+   * NodeDef lookup in hdMtlx and brings the import down. OpenUSD's HdMtlx
+   * ships a backward-compat shim (`HdMtlxGetNodeDefName`) that remaps
+   * `ND_normalmap` -> `ND_normalmap_float` for MaterialX 1.39+ consumers, so
+   * authoring the legacy name keeps us correct in both directions:
+   * 1.38 consumers resolve it directly, 1.39+ consumers go through the
+   * shim. See bite `nd-normalmap-float-nodedef-missing`. */
+  {
+    static const pxr::TfToken nd_normalmap("ND_normalmap", pxr::TfToken::Immortal);
+    static const pxr::TfToken nd_normalmap_float("ND_normalmap_float", pxr::TfToken::Immortal);
+    static const pxr::TfToken nd_normalmap_vector2("ND_normalmap_vector2",
+                                                   pxr::TfToken::Immortal);
+    for (pxr::UsdPrim prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (!shader.GetIdAttr().Get(&id_token)) {
+        continue;
+      }
+      if (id_token == nd_normalmap_float || id_token == nd_normalmap_vector2) {
+        shader.GetIdAttr().Set(pxr::VtValue(nd_normalmap));
+      }
+    }
+  }
+
   /* Next we need to find the Material that matches this materials name */
   auto temp_material_path = pxr::SdfPath("/root/Materials");
   temp_material_path = temp_material_path.AppendChild(material_prim.GetName());
@@ -1637,6 +1952,75 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
     rename_pairs.add_overwrite(original_path, new_path);
   }
 
+  /* Some shader nodes generated by the MaterialX export can be left structurally incomplete
+   * when an upstream node has no MaterialX equivalent in the bundled library (e.g. a
+   * `thin_film_bsdf`, which several MaterialX versions don't define). When that happens the
+   * generating NodeItem comes back empty and the consuming `layer` node is emitted with one of
+   * its BSDF inputs (`top`/`base`) left unconnected. A `layer` with an empty `top` (or `base`)
+   * is invalid for downstream MaterialX code generators: Karma, for instance, aborts the entire
+   * shader compile with "Error 1067: Reference to undefined variable", which makes every material
+   * on the asset fall back to default grey.
+   *
+   * To make the exported graph robust we bypass any such degenerate `layer` node: a layer with
+   * exactly one of `top`/`base` connected is semantically a pass-through of the connected input,
+   * so we record a redirect from the layer's output to that surviving source. Connections are
+   * then rewired to skip the degenerate node (resolved transitively, in case a survivor is itself
+   * a bypassed layer). The orphaned layer node is left in place and dead-code-eliminated by the
+   * renderer because nothing references its output any longer. */
+  Map<std::string, std::string> layer_bypass;
+  for (const auto &temp_child : temp_material_prim.GetAllDescendants()) {
+    auto temp_shader = pxr::UsdShadeShader(temp_child);
+    if (!temp_shader) {
+      continue;
+    }
+    pxr::TfToken shader_id;
+    if (!temp_shader.GetShaderId(&shader_id)) {
+      continue;
+    }
+    /* Only `layer` nodes (`ND_layer_bsdf`, `ND_layer_vdf`, ...) have the top/base structure. */
+    if (!pxr::TfStringStartsWith(shader_id.GetString(), "ND_layer_")) {
+      continue;
+    }
+
+    auto connected_source = [&](const char *input_name) -> pxr::SdfPath {
+      auto input = temp_shader.GetInput(pxr::TfToken(input_name));
+      if (!input) {
+        return pxr::SdfPath();
+      }
+      pxr::SdfPathVector conns;
+      input.GetAttr().GetConnections(&conns);
+      return conns.size() == 1 ? conns[0] : pxr::SdfPath();
+    };
+
+    const pxr::SdfPath top_src = connected_source("top");
+    const pxr::SdfPath base_src = connected_source("base");
+
+    /* Bypass only when exactly one input is connected. Both-connected layers are valid; an
+     * entirely empty layer is degenerate but rare, and we leave it untouched. */
+    if (top_src.IsEmpty() == base_src.IsEmpty()) {
+      continue;
+    }
+    const pxr::SdfPath &survivor = top_src.IsEmpty() ? base_src : top_src;
+
+    for (const auto &shader_output : temp_shader.GetOutputs()) {
+      layer_bypass.add_overwrite(shader_output.GetAttr().GetPath().GetString(),
+                                 survivor.GetString());
+    }
+  }
+
+  /* Resolve a connection target through any chain of bypassed layer nodes. */
+  auto resolve_layer_bypass = [&](const pxr::SdfPath &path) -> pxr::SdfPath {
+    std::string current = path.GetString();
+    for (int guard = 0; guard < 64; ++guard) {
+      const std::string *next = layer_bypass.lookup_ptr(current);
+      if (!next) {
+        break;
+      }
+      current = *next;
+    }
+    return pxr::SdfPath(current);
+  };
+
   /* We now need to find the connections from the material to the surface shader
    * and modify it to match the final target location */
   for (const auto &temp_material_output : temp_material.GetOutputs()) {
@@ -1644,6 +2028,7 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
 
     temp_material_output.GetAttr().GetConnections(&output_paths);
     if (output_paths.size() == 1) {
+      output_paths[0] = resolve_layer_bypass(output_paths[0]);
       output_paths[0] = reflow_materialx_paths(
           output_paths[0], temp_material_path, usd_path, rename_pairs);
 
@@ -1670,6 +2055,8 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
         continue;
       }
 
+      /* Skip past any degenerate `layer` node so the input connects to the surviving source. */
+      connection_paths[0] = resolve_layer_bypass(connection_paths[0]);
       const pxr::SdfPath &connection_path = connection_paths[0];
 
       auto connection_source = pxr::UsdShadeConnectionSourceInfo(temp_stage, connection_path);
@@ -1708,6 +2095,7 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
         continue;
       }
 
+      connection_paths[0] = resolve_layer_bypass(connection_paths[0]);
       connection_paths[0] = reflow_materialx_paths(
           connection_paths[0], temp_material_path, usd_path, rename_pairs);
       shader_output.GetAttr().SetConnections(connection_paths);
@@ -1736,25 +2124,85 @@ pxr::UsdShadeMaterial create_usd_material(const USDExporterContext &usd_export_c
   pxr::UsdShadeMaterial usd_material = pxr::UsdShadeMaterial::Define(usd_export_context.stage,
                                                                      usd_path);
 
-  if (usd_export_context.export_params.generate_preview_surface) {
-    create_usd_preview_surface_material(
-        usd_export_context, material, usd_material, active_uvmap_name, reports);
-  }
-  else {
-    create_usd_viewport_material(usd_export_context, material, usd_material);
-  }
-
+  /* Run MaterialX first so we can decide whether to also emit a UsdPreviewSurface arc.
+   * Karma (and every other MaterialX-capable Hydra delegate) prefers `outputs:mtlx:surface`
+   * over `outputs:surface` when both are present — the legacy dual-output authoring is
+   * dead weight in that case. See `emit_preview_surface_alongside_materialx` for the
+   * documented trade-off (USD consumers without MaterialX support lose all shading). */
+  bool materialx_authored_surface = false;
 #ifdef WITH_MATERIALX
   if (usd_export_context.export_params.generate_materialx_network) {
     create_usd_materialx_material(
         usd_export_context, usd_path, material, active_uvmap_name, usd_material);
+
+    if (pxr::UsdShadeOutput mtlx_surface = usd_material.GetSurfaceOutput(
+            pxr::TfToken("mtlx"))) {
+      pxr::SdfPathVector connections;
+      if (mtlx_surface.GetAttr().GetConnections(&connections) && !connections.empty()) {
+        materialx_authored_surface = true;
+      }
+    }
   }
 #endif
+
+  const bool skip_preview_surface =
+      materialx_authored_surface &&
+      !usd_export_context.export_params.emit_preview_surface_alongside_materialx;
+
+  if (!skip_preview_surface) {
+    if (usd_export_context.export_params.generate_preview_surface) {
+      create_usd_preview_surface_material(
+          usd_export_context, material, usd_material, active_uvmap_name, reports);
+    }
+    else {
+      create_usd_viewport_material(usd_export_context, material, usd_material);
+    }
+  }
 
   call_material_export_hooks(
       usd_export_context.stage, material, usd_material, usd_export_context.export_params, reports);
 
   return usd_material;
+}
+
+/* `primvars:karma:object:rendervisibility` is authored on the Material prim by
+ * BL-MAT-OPACITY-LIGHTPATH-DROP (PR #34) when an opacity socket is driven by a
+ * Light Path / Transparent BSDF cutout, encoding the artist's "camera-visible
+ * but no-shadow" intent that the bare `opacity=1.0` fallback discards. Karma's
+ * object-visibility scope is the geometry prim, however -- material-level
+ * authoring is ignored at render time -- so the bound mesh / curves prim never
+ * actually drops out of shadow rays. Propagating the primvar to the bound prim
+ * at material-binding time closes the loop: with the primvar on the geom prim,
+ * Karma honors the no-shadow intent and the surface stops casting a solid
+ * shadow it never cast under Cycles' Light-Path evaluation. */
+void propagate_karma_object_rendervisibility(const pxr::UsdShadeMaterial &usd_material,
+                                             const pxr::UsdPrim &bound_prim)
+{
+  if (!usd_material || !bound_prim) {
+    return;
+  }
+  static const pxr::TfToken karma_vis_token("primvars:karma:object:rendervisibility");
+  pxr::UsdAttribute mat_attr = usd_material.GetPrim().GetAttribute(karma_vis_token);
+  if (!mat_attr || !mat_attr.IsAuthored()) {
+    return;
+  }
+  pxr::VtValue value;
+  if (!mat_attr.Get(&value) || value.IsEmpty()) {
+    return;
+  }
+
+  pxr::UsdAttribute geom_attr = bound_prim.GetAttribute(karma_vis_token);
+  if (geom_attr && geom_attr.IsAuthored()) {
+    /* The geom already has an explicit authoring (artist override at the mesh /
+     * curves layer, or a previously-propagated material on a multi-slot mesh) --
+     * don't overwrite it. */
+    return;
+  }
+  pxr::UsdAttribute new_attr = bound_prim.CreateAttribute(karma_vis_token,
+                                                         pxr::SdfValueTypeNames->String,
+                                                         /*custom=*/false,
+                                                         pxr::SdfVariabilityUniform);
+  new_attr.Set(value);
 }
 
 }  // namespace io::usd
