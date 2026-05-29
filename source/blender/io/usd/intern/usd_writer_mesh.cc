@@ -9,6 +9,7 @@
 #include "usd_hierarchy_iterator.hh"
 #include "usd_skel_convert.hh"
 #include "usd_utils.hh"
+#include "usd_writer_material.hh"
 
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/primvarsAPI.h>
@@ -648,6 +649,12 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
     pxr::UsdShadeMaterial usd_material = ensure_usd_material(context, material);
     material_binding_api.Bind(usd_material);
 
+    /* Karma reads `primvars:karma:object:rendervisibility` from the geometry prim, so
+     * propagate it from the bound Material prim (authored by BL-MAT-OPACITY-LIGHTPATH-DROP,
+     * PR #34) here. Idempotent: a later subset bind will not overwrite an authoring already
+     * placed by the whole-prim bind. */
+    propagate_karma_object_rendervisibility(usd_material, mesh_prim);
+
     /* USD seems to support neither per-material nor per-face-group double-sidedness, so we just
      * use the flag from the first non-empty material slot. */
     usd_mesh.CreateDoubleSidedAttr(
@@ -695,6 +702,11 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
     subset_material_api.Bind(usd_material);
     /* Apply the #MaterialBindingAPI applied schema, as required by USD. */
     pxr::UsdShadeMaterialBindingAPI::Apply(subset_prim);
+
+    /* Karma reads object-visibility primvars from the geom prim (not the subset), so
+     * propagate to `mesh_prim`. The helper is idempotent, so the whole-prim bind above
+     * wins when both it and a subset carry the primvar. */
+    propagate_karma_object_rendervisibility(usd_material, mesh_prim);
   }
 }
 
