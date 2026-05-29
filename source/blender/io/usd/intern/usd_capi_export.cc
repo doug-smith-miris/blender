@@ -12,6 +12,7 @@
 #include "usd_instancing_utils.hh"
 #include "usd_light_convert.hh"
 #include "usd_private.hh"
+#include "usd_writer_material.hh"
 
 #include <pxr/base/tf/token.h>
 #include <pxr/pxr.h>
@@ -639,6 +640,12 @@ pxr::UsdStageRefPtr export_to_stage(const USDExportParams &params,
   }
 
   call_export_hooks(depsgraph, &iter, params.worker_status->reports);
+
+  /* Stamp `customLayerData["miris:requiresMaterialX"] = true` on the root layer if any
+   * MaterialX-only surface arc landed (PR #35 makes that the default, and some materials
+   * stay mtlx-only even with the opt-in flag). Downstream tools without MaterialX support
+   * use the marker to detect that they cannot render the layer faithfully. */
+  author_materialx_required_marker(usd_stage);
 
   worker_status->progress = 0.88f;
   worker_status->do_update = true;

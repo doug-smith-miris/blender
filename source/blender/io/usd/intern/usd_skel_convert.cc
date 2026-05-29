@@ -1243,7 +1243,10 @@ void skinned_mesh_export_chaser(pxr::UsdStageRefPtr stage,
     /* Look up the USD skeleton corresponding to the armature object. */
     const pxr::SdfPath *path = armature_export_map.lookup_ptr(arm_obj);
     if (!path) {
-      CLOG_WARN(&LOG, "No export map entry for armature object %s", mesh_obj->id.name + 2);
+      CLOG_WARN(&LOG,
+                "No export map entry for armature object %s (referenced by skinned mesh %s)",
+                arm_obj->id.name + 2,
+                mesh_obj->id.name + 2);
       continue;
     }
     /* Get the skeleton prim. */

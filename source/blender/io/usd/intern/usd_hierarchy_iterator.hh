@@ -59,7 +59,7 @@ class USDHierarchyIterator : public AbstractHierarchyIterator {
 
   std::string make_valid_name(const std::string &name) const override;
 
-  void process_usd_skel() const;
+  void process_usd_skel();
 
   /* Get the USD stage being exported to. */
   pxr::UsdStageRefPtr get_stage() const;
