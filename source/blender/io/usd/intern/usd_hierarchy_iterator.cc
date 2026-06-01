@@ -12,6 +12,8 @@
 #include "usd_utils.hh"
 #include "usd_writer_abstract.hh"
 #include "usd_writer_armature.hh"
+
+#include <pxr/usd/usdSkel/skeleton.h>
 #include "usd_writer_camera.hh"
 #include "usd_writer_curves.hh"
 #include "usd_writer_hair.hh"
@@ -91,8 +93,52 @@ std::string USDHierarchyIterator::make_valid_name(const std::string &name) const
   return make_safe_name(name, params_.allow_unicode);
 }
 
-void USDHierarchyIterator::process_usd_skel() const
+void USDHierarchyIterator::process_usd_skel()
 {
+  /* Fallback pass: a skinned mesh's armature can be referenced by its modifier without ever
+   * being visited by the iterator -- for example when the armature lives in a collection that
+   * is hidden from the render-eval depsgraph. The chaser would then drop the skeleton binding
+   * with a misleading "No export map entry for armature object <mesh>" warning. Author a rest-
+   * pose UsdSkelSkeleton for any such armature here, register it in the map, and let the
+   * chaser bind to it normally. */
+  for (const auto &item : skinned_mesh_export_map_.items()) {
+    const Object *mesh_obj = item.key;
+    const pxr::SdfPath &mesh_path = item.value;
+    const Object *arm_obj = get_armature_modifier_obj(*mesh_obj, depsgraph_);
+    if (!arm_obj || armature_export_map_.contains(arm_obj)) {
+      continue;
+    }
+
+    pxr::UsdPrim mesh_prim = stage_->GetPrimAtPath(mesh_path);
+    if (!mesh_prim) {
+      continue;
+    }
+
+    /* Place the skeleton at <mesh-parent>/Skel, matching the convention used by
+     * ensure_blend_shape_skeleton (usd_blend_shape_utils.cc) so SkelRoot detection collapses
+     * the two when both paths fire. */
+    static const pxr::TfToken skel_name("Skel", pxr::TfToken::Immortal);
+    const pxr::SdfPath skel_path = mesh_prim.GetParent().GetPath().AppendChild(skel_name);
+
+    pxr::UsdSkelSkeleton skel(stage_->GetPrimAtPath(skel_path));
+    if (!skel) {
+      skel = pxr::UsdSkelSkeleton::Define(stage_, skel_path);
+    }
+    if (!skel) {
+      continue;
+    }
+
+    /* Mirror USDArmatureWriter: respect only_deform_bones by feeding the deform map. */
+    Map<StringRef, const Bone *> deform_map;
+    if (params_.only_deform_bones) {
+      init_deform_bones_map(arm_obj, &deform_map);
+    }
+    init_skeleton_from_armature(
+        arm_obj, skel, params_.only_deform_bones ? &deform_map : nullptr, params_.allow_unicode);
+
+    armature_export_map_.add(arm_obj, skel_path);
+  }
+
   skel_export_chaser(stage_,
                      armature_export_map_,
                      skinned_mesh_export_map_,

@@ -11,6 +11,7 @@
 
 #include <pxr/base/tf/token.h>
 #include <pxr/usd/usdSkel/animation.h>
+#include <pxr/usd/usdSkel/skeleton.h>
 
 namespace blender {
 
@@ -143,6 +144,24 @@ bool can_export_skinned_mesh(const Object &obj, const Depsgraph *depsgraph);
  *                    their parents found on the object
  */
 void init_deform_bones_map(const Object *obj, Map<StringRef, const Bone *> *deform_map);
+
+/**
+ * Populate the given USD skeleton with joints, bind transforms, rest transforms, and the
+ * Blender bone-length primvar derived from the armature object's bones. Used to author a
+ * rest-pose skeleton for skinned-mesh bindings when the armature itself was not visited by
+ * the hierarchy iterator (e.g. because its collection is hidden from the render-eval
+ * depsgraph). Does NOT author animation samples.
+ *
+ * \param obj: The armature object to read bones from
+ * \param skel: The destination USD skeleton
+ * \param deform_bones: Optional map of deform-bone names; when non-null, bones not present
+ *                      are skipped (mirrors the export's `only_deform_bones` filter)
+ * \param allow_unicode: Whether to allow unicode bone names in joint paths
+ */
+void init_skeleton_from_armature(const Object *obj,
+                                 pxr::UsdSkelSkeleton &skel,
+                                 const Map<StringRef, const Bone *> *deform_bones,
+                                 bool allow_unicode);
 
 }  // namespace io::usd
 }  // namespace blender
