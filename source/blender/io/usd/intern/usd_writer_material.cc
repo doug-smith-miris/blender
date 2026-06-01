@@ -1907,6 +1907,39 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
     }
   }
 
+  /* Normalize the MaterialX `normalmap` nodedef name to the version-agnostic
+   * `ND_normalmap` form. UsdMtlxRead writes the MaterialX-1.39-suffixed
+   * `ND_normalmap_float` / `ND_normalmap_vector2` (the suffix is the `scale`
+   * input's type), but consumers on MaterialX 1.38 stdlibs (older Omniverse
+   * USD builds, older Hydra Storm) only know the legacy un-suffixed
+   * `ND_normalmap` nodedef name. Failing to resolve the suffixed name aborts
+   * the consumer's MaterialX network parse — on Omniverse this hits the
+   * NodeDef lookup in hdMtlx and brings the import down. OpenUSD's HdMtlx
+   * ships a backward-compat shim (`HdMtlxGetNodeDefName`) that remaps
+   * `ND_normalmap` -> `ND_normalmap_float` for MaterialX 1.39+ consumers, so
+   * authoring the legacy name keeps us correct in both directions:
+   * 1.38 consumers resolve it directly, 1.39+ consumers go through the
+   * shim. See bite `nd-normalmap-float-nodedef-missing`. */
+  {
+    static const pxr::TfToken nd_normalmap("ND_normalmap", pxr::TfToken::Immortal);
+    static const pxr::TfToken nd_normalmap_float("ND_normalmap_float", pxr::TfToken::Immortal);
+    static const pxr::TfToken nd_normalmap_vector2("ND_normalmap_vector2",
+                                                   pxr::TfToken::Immortal);
+    for (pxr::UsdPrim prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (!shader.GetIdAttr().Get(&id_token)) {
+        continue;
+      }
+      if (id_token == nd_normalmap_float || id_token == nd_normalmap_vector2) {
+        shader.GetIdAttr().Set(pxr::VtValue(nd_normalmap));
+      }
+    }
+  }
+
   /* Next we need to find the Material that matches this materials name */
   auto temp_material_path = pxr::SdfPath("/root/Materials");
   temp_material_path = temp_material_path.AppendChild(material_prim.GetName());
