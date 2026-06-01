@@ -148,24 +148,40 @@ def check_material(stage, name, *, require_rendervisibility):
                     f"{name}: `{KARMA_VIS_ATTR}` is authored but has no value"
                 )
             else:
-                val_str = str(val)
-                # The primvar must explicitly exclude "shadow" -- a wildcard "*"
-                # would defeat the whole purpose of the bite (it keeps shadow on).
-                if "shadow" in val_str.lower() or val_str.strip() == "*":
+                val_str = str(val).strip()
+                # Karma syntax (see Houdini `BRAY_HdKarma_Geometry.ds`):
+                # `*` = visible to all (does NOT exclude shadow);
+                # `-shadow` = invisible to shadow (camera + secondary visible);
+                # `*&-shadow` = same;
+                # `primary` = visible only to camera rays (also excludes shadow).
+                # The artist's Light-Path-IsCameraRay cutout maps to "exclude
+                # shadow but stay otherwise visible", and Karma must actually
+                # parse the value -- comma-delimited token lists with the
+                # `camera` alias from the original PR #34 silently dropped the
+                # surface entirely as soon as the primvar reached the geom prim.
+                excludes_shadow = (
+                    val_str == "-shadow"
+                    or val_str == "primary"
+                    or "-shadow" in val_str
+                )
+                wildcard_grants_all = (val_str == "*")
+                # If the value uses comma-separated tokens with no Karma
+                # syntactical markers (no `*`, no `-`, no `|`), it's the old
+                # malformed list that Karma cannot parse.
+                karma_syntax_ok = (
+                    "-" in val_str
+                    or val_str.startswith("*")
+                    or "|" in val_str
+                    or val_str == "primary"
+                )
+                if wildcard_grants_all or not excludes_shadow or not karma_syntax_ok:
                     failures.append(
-                        f"{name}: `{KARMA_VIS_ATTR}` = {val_str!r} still grants "
-                        "shadow visibility -- the Light-Path cutout's shadow-cull "
-                        "intent is not preserved"
+                        f"{name}: `{KARMA_VIS_ATTR}` = {val_str!r} does not "
+                        "encode a Karma-valid Light-Path no-shadow cutout. "
+                        "Expected `-shadow` (or `*&-shadow`, `primary`) -- "
+                        "Karma uses `|` separators and `-token` for "
+                        "exclusions, not comma lists."
                     )
-                else:
-                    # Sanity: keep the obvious "visible to camera" category.
-                    if "camera" not in val_str.lower() and "primary" not in val_str.lower():
-                        failures.append(
-                            f"{name}: `{KARMA_VIS_ATTR}` = {val_str!r} drops camera "
-                            "visibility -- opacity=1.0 says the surface IS visible "
-                            "to the camera, so the primvar must include the camera "
-                            "ray class"
-                        )
     return failures
 
 

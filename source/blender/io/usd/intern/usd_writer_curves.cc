@@ -20,6 +20,7 @@
 #include "usd_hierarchy_iterator.hh"
 #include "usd_utils.hh"
 #include "usd_writer_curves.hh"
+#include "usd_writer_material.hh"
 
 #include "BLI_array_utils.hh"
 #include "BLI_generic_virtual_array.hh"
@@ -790,6 +791,12 @@ void USDCurvesWriter::assign_materials(const HierarchyContext &context,
   api.Bind(first_usd_material);
   pxr::UsdShadeMaterialBindingAPI::Apply(curve_prim);
 
+  /* Propagate the Karma object-visibility primvar from the bound Material to the curve
+   * prim (Karma reads it from the geometry prim, not the Material -- see
+   * BL-MAT-OPACITY-LIGHTPATH-DROP, PR #34). Idempotent: the per-curve subset loop below
+   * won't overwrite a value already authored here. */
+  propagate_karma_object_rendervisibility(first_usd_material, curve_prim);
+
   /* USD seems to support neither per-material nor per-face-group double-sidedness, so we just
    * use the flag from the first non-empty material slot. */
   usd_curves.CreateDoubleSidedAttr(
@@ -839,6 +846,10 @@ void USDCurvesWriter::assign_materials(const HierarchyContext &context,
     pxr::UsdShadeMaterialBindingAPI subset_api(subset_prim);
     subset_api.Bind(usd_material);
     pxr::UsdShadeMaterialBindingAPI::Apply(subset_prim);
+
+    /* Karma reads object-visibility primvars from the curve prim (not subsets), so
+     * propagate to `curve_prim`. Idempotent. */
+    propagate_karma_object_rendervisibility(usd_material, curve_prim);
   }
 }
 

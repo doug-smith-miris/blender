@@ -495,12 +495,24 @@ static void process_inputs(const USDExporterContext &usd_export_context,
                * PR #27 invariant for swarmfish creature_body still holds; delegates
                * that do not recognise this primvar simply ignore it. */
               if (is_visibility_cutout) {
+                /* Karma's `primvars:karma:object:rendervisibility` parser uses
+                 * pipe-separated ray flags with `-` prefix for exclusion (see
+                 * Houdini `BRAY_HdKarma_Geometry.ds`). Valid tokens are `*`,
+                 * `primary`, `shadow`, `reflect`, `refract`, `diffuse`, `glossy`,
+                 * `volume`. The previous comma-delimited list with the `camera`
+                 * alias parsed as "nothing recognised" and dropped the surface
+                 * from primary rays as soon as it was on the geom prim (Karma
+                 * silently ignored it on the Material prim, masking the bug).
+                 * `-shadow` is the documented "Invisible to shadow rays" preset:
+                 * visible to camera + reflect + refract + diffuse + glossy +
+                 * volume, but cast no shadow -- exactly the artist's Light-Path
+                 * cutout intent. */
                 pxr::UsdAttribute karma_vis = usd_material.GetPrim().CreateAttribute(
                     pxr::TfToken("primvars:karma:object:rendervisibility"),
                     pxr::SdfValueTypeNames->String,
                     /*custom=*/false,
                     pxr::SdfVariabilityUniform);
-                karma_vis.Set(std::string("camera,reflect,refract,diffuse,glossy,volume"));
+                karma_vis.Set(std::string("-shadow"));
               }
             }
             else {
@@ -2262,6 +2274,46 @@ pxr::UsdShadeMaterial create_usd_material(const USDExporterContext &usd_export_c
       usd_export_context.stage, material, usd_material, usd_export_context.export_params, reports);
 
   return usd_material;
+}
+
+/* `primvars:karma:object:rendervisibility` is authored on the Material prim by
+ * BL-MAT-OPACITY-LIGHTPATH-DROP (PR #34) when an opacity socket is driven by a
+ * Light Path / Transparent BSDF cutout, encoding the artist's "camera-visible
+ * but no-shadow" intent that the bare `opacity=1.0` fallback discards. Karma's
+ * object-visibility scope is the geometry prim, however -- material-level
+ * authoring is ignored at render time -- so the bound mesh / curves prim never
+ * actually drops out of shadow rays. Propagating the primvar to the bound prim
+ * at material-binding time closes the loop: with the primvar on the geom prim,
+ * Karma honors the no-shadow intent and the surface stops casting a solid
+ * shadow it never cast under Cycles' Light-Path evaluation. */
+void propagate_karma_object_rendervisibility(const pxr::UsdShadeMaterial &usd_material,
+                                             const pxr::UsdPrim &bound_prim)
+{
+  if (!usd_material || !bound_prim) {
+    return;
+  }
+  static const pxr::TfToken karma_vis_token("primvars:karma:object:rendervisibility");
+  pxr::UsdAttribute mat_attr = usd_material.GetPrim().GetAttribute(karma_vis_token);
+  if (!mat_attr || !mat_attr.IsAuthored()) {
+    return;
+  }
+  pxr::VtValue value;
+  if (!mat_attr.Get(&value) || value.IsEmpty()) {
+    return;
+  }
+
+  pxr::UsdAttribute geom_attr = bound_prim.GetAttribute(karma_vis_token);
+  if (geom_attr && geom_attr.IsAuthored()) {
+    /* The geom already has an explicit authoring (artist override at the mesh /
+     * curves layer, or a previously-propagated material on a multi-slot mesh) --
+     * don't overwrite it. */
+    return;
+  }
+  pxr::UsdAttribute new_attr = bound_prim.CreateAttribute(karma_vis_token,
+                                                         pxr::SdfValueTypeNames->String,
+                                                         /*custom=*/false,
+                                                         pxr::SdfVariabilityUniform);
+  new_attr.Set(value);
 }
 
 }  // namespace io::usd
