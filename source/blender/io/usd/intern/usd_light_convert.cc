@@ -174,9 +174,41 @@ void world_material_to_dome_light(const USDExportParams &params,
   pxr::UsdLuxDomeLight dome_light = pxr::UsdLuxDomeLight::Define(stage, env_light_path);
   colorspace_apply_to_prim(dome_light.GetPrim());
 
+  /* Author the Background node's Strength as `inputs:intensity` regardless of
+   * whether the world uses a textured environment or a solid color. The
+   * previous image-branch path never authored intensity, which silently
+   * defaulted the dome to 1.0 and discarded any non-default Background
+   * Strength the artist set — so an HDRI lit at Strength=5 round-tripped as
+   * a dome at intensity=1, lighting the scene 5x too dimly and (in Hydra
+   * delegates that gate camera-visibility on a non-zero intensity threshold)
+   * suppressing the dome backdrop entirely. */
+  if (res.color_found) {
+    dome_light.CreateIntensityAttr().Set(res.intensity);
+  }
+
+  /* Make the dome backdrop explicitly camera-visible for Karma. Hydra delegates
+   * that consult the Karma object-visibility primvar (Karma, including XPU)
+   * otherwise see no authored visibility for the dome and may skip rendering
+   * it on primary camera rays — producing a blown-out white backdrop while
+   * indirect lighting still works. Authoring `"*"` keeps the dome visible
+   * across all ray classes; other delegates ignore the unknown primvar. */
+  pxr::UsdAttribute karma_vis = dome_light.GetPrim().CreateAttribute(
+      pxr::TfToken("primvars:karma:object:rendervisibility"),
+      pxr::SdfValueTypeNames->String,
+      /*custom=*/false,
+      pxr::SdfVariabilityUniform);
+  karma_vis.Set(std::string("*"));
+
   if (res.image) {
     /* Use existing image texture file. */
     dome_light.CreateTextureFileAttr().Set(pxr::SdfAssetPath(image_filepath));
+
+    /* Blender's Environment Texture node always emits an equirectangular
+     * (lat-long) projection, so author the format explicitly rather than
+     * leaving it at the schema default `automatic`. Karma's XPU path
+     * documents that it only supports lat-long environment maps on dome
+     * lights, and other delegates inspect this token before sampling. */
+    dome_light.CreateTextureFormatAttr().Set(pxr::UsdLuxTokens->latlong);
 
     /* Set optional color multiplication. */
     if (res.mult_found) {
@@ -193,9 +225,8 @@ void world_material_to_dome_light(const USDExportParams &params,
   }
   else if (res.color_found) {
     /* If no texture is found export a solid color texture as a stand-in so that Hydra
-     * renderers don't throw errors. */
-    dome_light.CreateIntensityAttr().Set(res.intensity);
-
+     * renderers don't throw errors. Intensity is already authored above from the
+     * Background node's Strength. */
     std::string source_path = cache_image_color(res.color);
     const std::string base_path = stage->GetRootLayer()->GetRealPath();
 
