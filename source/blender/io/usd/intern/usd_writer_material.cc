@@ -1066,123 +1066,73 @@ static pxr::TfToken get_node_tex_image_wrap(const bNode *node)
   return wrap;
 }
 
-/* Returns whether the given input socket on the given intermediate node carries the value
- * the node outputs — as opposed to "modulating" it (Fac, Hue, Saturation, etc.). Used by
- * traverse_channel to avoid descending into unrelated sibling inputs and pulling textures
- * from branches that have nothing to do with the Principled input being traced.
- *
- * Returning false for unknown node types is intentional: the safe default is to stop
- * walking rather than greedily picking up any texture that happens to be deep inside
- * the graph. This is what was causing creature-body's roughness EXR to be wired into
- * diffuseColor and emissiveColor (BL-MAT-001-wrong-texture-wired-by-naive-traversal). */
-static bool is_value_carrier_input(const bNode *node, const bNodeSocket *sock)
+/* Returns true if `sock_name` (the Blender display name of an input socket)
+ * is one of the signal-carrying inputs we are willing to descend into when
+ * walking upstream from `linked_node` looking for `target_type`. */
+static bool is_signal_carrying_input(const bNode *linked_node, const char *sock_name)
 {
-  const StringRef name(sock->name);
-
-  switch (node->type_legacy) {
-    /* Pass-through structural nodes: always follow the only input. */
+  if (!linked_node || !sock_name) {
+    return false;
+  }
+  switch (linked_node->type_legacy) {
+    /* Reroute has a single (unnamed) input that always carries the signal. */
     case NODE_REROUTE:
       return true;
-
-    /* Color-modifying nodes: only the Color input carries the color through to the output. */
-    case SH_NODE_CURVE_RGB:        /* RGB Curves */
-    case SH_NODE_HUE_SAT:           /* Hue/Saturation/Value */
-    case SH_NODE_INVERT:
-    case SH_NODE_BRIGHTCONTRAST:
-    case SH_NODE_GAMMA:
-      return name == "Color";
-
-    /* Color Ramp: the Fac input drives the lookup; the output is a color. */
-    case SH_NODE_VALTORGB:
-      return name == "Fac";
-
-    /* Vector/float curves: pass the named carrier through. */
-    case SH_NODE_CURVE_VEC:
-      return name == "Vector";
-    case SH_NODE_CURVE_FLOAT:
-      return name == "Value";
-
-    /* Mix nodes: both data inputs are carriers; Fac is just the blend amount. */
-    case SH_NODE_MIX_RGB_LEGACY:
-      return name == "Color1" || name == "Color2";
-    case SH_NODE_MIX: {
-      /* The new Mix node names its data sockets "A" and "B" across data types,
-       * with suffixed identifiers ("A_Color", "A_Float", etc.). Match by name
-       * to remain agnostic to the data type. */
-      const StringRef ident(sock->identifier);
-      return name == "A" || name == "B" || ident == "A" || ident == "B" ||
-             ident.startswith("A_") || ident.startswith("B_");
-    }
-
-    /* Color channel split/recombine: the single Color input or the named channel
-     * inputs all carry the value. */
-    case SH_NODE_SEPARATE_COLOR:
-    case SH_NODE_SEPRGB_LEGACY:
-    case SH_NODE_SEPHSV_LEGACY:
-      return name == "Color" || name == "Image";
-    case SH_NODE_COMBINE_COLOR:
-    case SH_NODE_COMBRGB_LEGACY:
-    case SH_NODE_COMBHSV_LEGACY:
-      return name == "Red" || name == "Green" || name == "Blue" || name == "R" ||
-             name == "G" || name == "B" || name == "Hue" || name == "Saturation" ||
-             name == "Value";
-
-    /* Vector channel split/recombine. */
-    case SH_NODE_SEPXYZ:
-      return name == "Vector";
-    case SH_NODE_COMBXYZ:
-      return name == "X" || name == "Y" || name == "Z";
-
-    /* Math: any numeric input can carry the value being computed (scale-bias detection
-     * downstream depends on this permissiveness). */
-    case SH_NODE_MATH:
-    case SH_NODE_VECTOR_MATH:
-    case SH_NODE_CLAMP:
-      return true;
-
-    /* Map Range: only the Value/Vector input is the thing being remapped; the
-     * From Min/From Max/To Min/To Max sockets are constants and must not be
-     * descended into. */
-    case SH_NODE_MAP_RANGE:
-      return name == "Value" || name == "Vector";
-
-    /* Normal-construction nodes: the texture lives on Color (Normal Map) or Height (Bump). */
+    /* Texture-on-color chains: the Color input carries the upstream image. */
     case SH_NODE_NORMAL_MAP:
-      return name == "Color";
+    case SH_NODE_SEPARATE_COLOR:
+      return STREQ(sock_name, "Color");
+    /* Bump / Displacement: the Height input carries the upstream texture. */
     case SH_NODE_BUMP:
-      return name == "Height" || name == "Normal";
-
-    /* Displacement helpers. */
     case SH_NODE_DISPLACEMENT:
-      return name == "Height" || name == "Normal";
-    case SH_NODE_VECTOR_DISPLACEMENT:
-      return name == "Vector";
-
-    /* Shader-graph plumbing that we cross transparently. */
-    case SH_NODE_SHADERTORGB:
-      return name == "Shader";
-
+      return STREQ(sock_name, "Height");
+    /* Combine Color: pass through the per-channel inputs in RGB mode. */
+    case SH_NODE_COMBINE_COLOR:
+      return STREQ(sock_name, "Red") || STREQ(sock_name, "Green") || STREQ(sock_name, "Blue");
+    /* Mapping: only the Vector input carries the upstream UV/coord source. */
+    case SH_NODE_MAPPING:
+      return STREQ(sock_name, "Vector");
+    /* Math: the two Value operands carry the upstream value. */
+    case SH_NODE_MATH:
+      return STREQ(sock_name, "Value");
+    /* Vector Math: the two Vector operands carry the upstream vector. */
+    case SH_NODE_VECTOR_MATH:
+      return STREQ(sock_name, "Vector");
     default:
-      /* Unknown intermediate node type: do NOT recurse. This is the channel-aware
-       * filter that prevents mis-wiring textures from unrelated branches. */
+      /* Color-modifying or value-modulating intermediates we cannot represent
+       * losslessly in UsdPreviewSurface (RGB Curves, Hue/Saturation, Float
+       * Curve, Color Ramp, Mix, Map Range, Clamp, Gamma, Brightness/Contrast,
+       * Invert, ...) and unknown node types: refuse to descend. Walking
+       * through them would silently flatten the artist's intent — and worse,
+       * a deep DFS through unrelated control inputs (Hue, Saturation, Factor,
+       * Map-Range From/To-Min/Max, ColorRamp Fac) can latch onto an Image
+       * Texture from a totally different channel and attach it as the source
+       * for this input. See BL-MAT-traverse-channel-naive-dfs-wrong-input-
+       * wiring. */
       return false;
   }
 }
 
-/* Search the upstream node links connected to the given socket and return the first occurrence
- * of the link connected to the node of the given type. Return null if no such link was found.
- * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null.
+/* Walks upstream from the given input socket and returns the first link
+ * whose fromnode is of `target_type`. Returns null if no such terminal can
+ * be reached following only signal-carrying inputs (see
+ * `is_signal_carrying_input`). The returned link's `fromnode` and `fromsock`
+ * are guaranteed non-null.
  *
- * The traversal crosses ShaderNodeGroup boundaries so that wrappers do not flatten Principled
- * BSDF inputs (UDIM image textures, normal maps, etc.) to socket defaults. `group_stack` tracks
- * the parent group nodes so a NodeGroupInput proxy inside a group can be mapped back to the
- * driving socket on the parent group node.
- */
-static bNodeLink *traverse_channel(bNodeSocket *input,
-                                   const short target_type,
-                                   Vector<bNode *> &group_stack)
+ * Implementation note (BL-MAT-traverse-channel-naive-dfs-wrong-input-wiring):
+ * the prior implementation did a naive DFS through *every* input of every
+ * intermediate node, including modulator and control inputs of color-
+ * modifying nodes. That caused the BSDF's Base Color traversal to find and
+ * attach an Image Texture wired into a completely unrelated control channel
+ * (e.g. a Hue/Saturation Hue operand, a Mix Factor driven by Map Range, a
+ * ColorRamp Fac). The exported UsdPreviewSurface ended up with diffuseColor
+ * pointing at the roughness texture, normal pointing at the diffuse texture,
+ * and so on. This version restricts the descent to nodes whose signal-flow
+ * we can identify, and halts at color-modifying intermediates rather than
+ * misattributing the deeper image. */
+static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
 {
-  if (!(input->link && input->link->fromnode && input->link->fromsock)) {
+  if (!(input && input->link && input->link->fromnode && input->link->fromsock)) {
     return nullptr;
   }
 
@@ -1192,45 +1142,12 @@ static bNodeLink *traverse_channel(bNodeSocket *input,
     return input->link;
   }
 
-  /* Descend into a ShaderNodeGroup: continue traversal from the matching socket on the
-   * group's NodeGroupOutput. The fromsock identifier is the stable Blender socket id and
-   * matches between the group node's output and the GroupOutput's mirrored input. */
-  if (linked_node->type_legacy == NODE_GROUP && linked_node->id) {
-    bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(linked_node->id);
-    group_tree->ensure_topology_cache();
-    if (bNode *group_out = group_tree->group_output_node()) {
-      const StringRef fromsock_id = input->link->fromsock->identifier;
-      for (bNodeSocket *inner_sock : group_out->input_sockets()) {
-        if (fromsock_id == inner_sock->identifier) {
-          group_stack.append(linked_node);
-          bNodeLink *result = traverse_channel(inner_sock, target_type, group_stack);
-          group_stack.pop_last();
-          return result;
-        }
-      }
-    }
-    return nullptr;
-  }
-
-  /* Ascend out of a ShaderNodeGroup: a NodeGroupInput proxies the parent group node's inputs.
-   * Without a known parent the group is being inspected standalone — fall through. */
-  if (linked_node->type_legacy == NODE_GROUP_INPUT && !group_stack.is_empty()) {
-    bNode *parent_group = group_stack.last();
-    const StringRef fromsock_id = input->link->fromsock->identifier;
-    for (bNodeSocket *outer_sock : parent_group->input_sockets()) {
-      if (fromsock_id == outer_sock->identifier) {
-        bNode *popped = group_stack.pop_last();
-        bNodeLink *result = traverse_channel(outer_sock, target_type, group_stack);
-        group_stack.append(popped);
-        return result;
-      }
-    }
-    return nullptr;
-  }
-
-  /* Recursively traverse the linked node's sockets. */
+  /* Recursively traverse only the signal-carrying inputs of the linked node. */
   for (bNodeSocket &sock : linked_node->inputs) {
-    if (bNodeLink *found_link = traverse_channel(&sock, target_type, group_stack)) {
+    if (!is_signal_carrying_input(linked_node, sock.name)) {
+      continue;
+    }
+    if (bNodeLink *found_link = traverse_channel(&sock, target_type)) {
       return found_link;
     }
   }
