@@ -45,6 +45,7 @@
 #  include "shader/materialx/material.h"
 #  include <MaterialXCore/Node.h>
 #  include <pxr/usd/sdf/copyUtils.h>
+#  include <pxr/usd/usd/primRange.h>
 #  include <pxr/usd/usdMtlx/materialXConfigAPI.h>
 #  include <pxr/usd/usdMtlx/reader.h>
 #  include <pxr/usd/usdMtlx/utils.h>
@@ -1857,6 +1858,76 @@ static void create_usd_materialx_material(const USDExporterContext &usd_export_c
 
   auto temp_stage = pxr::UsdStage::CreateInMemory();
   pxr::UsdMtlxRead(doc, temp_stage, pxr::SdfPath("/root"));
+
+  /* Prune phantom Shader prims and orphan shader-typed input declarations
+   * that `UsdMtlxRead` leaves behind when it can't resolve a MaterialX
+   * nodedef. Blender's MaterialX writer emits categories like
+   * `thin_film_bsdf` that the bundled USD MaterialX library doesn't
+   * recognise (typical for the Principled BSDF's iridescence component on
+   * hero assets such as mikassa). The reader then:
+   *   * skips authoring `info:id` and outputs on the unresolved node — it
+   *     stays as an input-only Shader stub;
+   *   * drops every `inputs:*.connect` that targeted that node's outputs —
+   *     but the consumer's `inputs:NAME` attribute spec is still authored
+   *     with `renderType = "BSDF"` (or similar) and no value and no
+   *     connection.
+   * Both kinds of orphan trip Karma's MaterialX shader compiler with
+   * `Error 1067: Reference to undefined variable: out_N`. Strip them so
+   * the resulting USD is internally consistent. Consumer inputs already
+   * fall back to their typed defaults; we just need to delete the dead
+   * specs. */
+  {
+    pxr::SdfPathVector phantom_shader_paths;
+    for (const pxr::UsdPrim &prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (shader.GetIdAttr().Get(&id_token) && !id_token.IsEmpty()) {
+        continue;
+      }
+      phantom_shader_paths.push_back(prim.GetPath());
+    }
+    for (const pxr::SdfPath &path : phantom_shader_paths) {
+      temp_stage->RemovePrim(path);
+    }
+
+    /* Walk surviving Shaders for shader-typed input attributes (token /
+     * BSDF / EDF / surfaceshader) whose connection the reader dropped.
+     * Remove the attribute spec entirely so the consumer simply uses its
+     * default for that input rather than authoring an empty, unresolvable
+     * reference. */
+    for (pxr::UsdPrim prim : temp_stage->Traverse()) {
+      pxr::UsdShadeShader shader(prim);
+      if (!shader) {
+        continue;
+      }
+      pxr::TfToken id_token;
+      if (!shader.GetIdAttr().Get(&id_token) || id_token.IsEmpty()) {
+        continue;
+      }
+      Vector<pxr::TfToken> input_names_to_erase;
+      for (const pxr::UsdShadeInput &input : shader.GetInputs()) {
+        const pxr::UsdAttribute attr = input.GetAttr();
+        if (attr.GetTypeName() != pxr::SdfValueTypeNames->Token) {
+          continue;
+        }
+        pxr::SdfPathVector connections;
+        attr.GetConnections(&connections);
+        if (!connections.empty()) {
+          continue;
+        }
+        if (attr.HasAuthoredValue()) {
+          continue;
+        }
+        input_names_to_erase.append(attr.GetName());
+      }
+      for (const pxr::TfToken &name : input_names_to_erase) {
+        prim.RemoveProperty(name);
+      }
+    }
+  }
 
   /* Next we need to find the Material that matches this materials name */
   auto temp_material_path = pxr::SdfPath("/root/Materials");
