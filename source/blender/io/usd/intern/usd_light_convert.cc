@@ -28,6 +28,8 @@
 #include "BKE_node_runtime.hh"
 #include "BKE_node_tree_update.hh"
 
+#include "NOD_shader.h"
+
 #include "BLI_fileops.h"
 #include "BLI_math_vector.h"
 #include "BLI_path_utils.hh"
@@ -520,16 +522,70 @@ static bool node_search(bNode *fromnode, bNode * /*tonode*/, void *userdata, boo
 
 void world_material_to_dome_light(const Scene *scene, WorldToDomeLight &res)
 {
-  /* Find the world output. */
-  scene->world->nodetree->ensure_topology_cache();
-  const Span<const bNode *> bsdf_nodes = scene->world->nodetree->nodes_by_type(
-      "ShaderNodeOutputWorld"_ustr);
+  /* Find the world output.
+   *
+   * materialx-world-domelight-no-outputall-fallback: stock Blender's dome-light export picked
+   * the first SH_NODE_OUTPUT_WORLD with `NODE_DO_OUTPUT` set, without filtering by engine
+   * target. Production .blends commonly carry both Cycles- and EEVEE-specific outputs (each
+   * carrying its own `NODE_DO_OUTPUT` for the engine it represents), and the unscoped scan
+   * silently picked whichever appeared first in the node list — sometimes dropping the
+   * artist's authoritative Cycles HDRI network when an EEVEE-only output happened to lead.
+   * If the world tree has only engine-specific outputs (no SHD_OUTPUT_ALL one), no
+   * `NODE_DO_OUTPUT` is set on any of them under some scene-engine combinations and the
+   * dome-light is exported empty / defaulted.
+   *
+   * Mirror PR #33's analogous ALL → CYCLES → EEVEE fallback for the MaterialX export path
+   * (source/blender/nodes/shader/materialx/material.cc::export_to_materialx): scan the
+   * tree for available engine targets, pick the most universal one present (ALL preferred,
+   * then CYCLES as the "final-quality offline" convention HDRIs are authored for, then
+   * EEVEE), and let `ntreeShaderOutputNode` apply NODE_DO_OUTPUT preference within that
+   * target. The legacy first-DO_OUTPUT loop remains as a last-resort fallback to keep
+   * any pre-existing edge case behaving the same. */
+  bNodeTree *ntree = scene->world->nodetree;
+  ntree->ensure_topology_cache();
 
-  for (const bNode *node : bsdf_nodes) {
-    if (node->flag & NODE_DO_OUTPUT) {
-      bke::node_chain_iterator(scene->world->nodetree, node, node_search, &res, true);
-      break;
+  bool has_all = false, has_cycles = false, has_eevee = false;
+  for (const bNode *node : ntree->nodes_by_type("ShaderNodeOutputWorld"_ustr)) {
+    switch (node->custom1) {
+      case SHD_OUTPUT_ALL:
+        has_all = true;
+        break;
+      case SHD_OUTPUT_CYCLES:
+        has_cycles = true;
+        break;
+      case SHD_OUTPUT_EEVEE:
+        has_eevee = true;
+        break;
+      default:
+        break;
     }
+  }
+
+  const bNode *picked_output = nullptr;
+  if (has_all) {
+    picked_output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_ALL);
+  }
+  else if (has_cycles) {
+    picked_output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_CYCLES);
+  }
+  else if (has_eevee) {
+    picked_output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_EEVEE);
+  }
+
+  if (!picked_output) {
+    /* Legacy fallback — first SH_NODE_OUTPUT_WORLD with NODE_DO_OUTPUT. Reached only when
+     * the tree has SH_NODE_OUTPUT_WORLD nodes with non-standard `custom1` values, or when
+     * ntreeShaderOutputNode returned null for the chosen target. */
+    for (const bNode *node : ntree->nodes_by_type("ShaderNodeOutputWorld"_ustr)) {
+      if (node->flag & NODE_DO_OUTPUT) {
+        picked_output = node;
+        break;
+      }
+    }
+  }
+
+  if (picked_output) {
+    bke::node_chain_iterator(ntree, picked_output, node_search, &res, true);
   }
 }
 
