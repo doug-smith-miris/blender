@@ -1170,17 +1170,11 @@ static bool is_value_carrier_input(const bNode *node, const bNodeSocket *sock)
  * of the link connected to the node of the given type. Return null if no such link was found.
  * The 'fromnode' and 'fromsock' members of the returned link are guaranteed to be not null.
  *
- * Crosses ShaderNodeGroup boundaries transparently: when the upstream node is a group,
- * the traversal descends through the matching NodeGroupOutput socket; when it hits a
- * NodeGroupInput inside a group, it ascends back out via the parent group node's matching
- * input socket. `group_stack` tracks the chain of parent group nodes that have been entered
- * so the ascent goes back to the right place.
- *
- * The generic DFS only recurses through inputs that are "value carriers" for their parent
- * intermediate node (see is_value_carrier_input). This is the fix for
- * BL-MAT-001-wrong-texture-wired-by-naive-traversal: previously the DFS descended into every
- * input socket of every intermediate node, so a texture connected to e.g. a Hue/Saturation
- * node's Hue input could be returned as the diffuseColor source. */
+ * The traversal crosses ShaderNodeGroup boundaries so that wrappers do not flatten Principled
+ * BSDF inputs (UDIM image textures, normal maps, etc.) to socket defaults. `group_stack` tracks
+ * the parent group nodes so a NodeGroupInput proxy inside a group can be mapped back to the
+ * driving socket on the parent group node.
+ */
 static bNodeLink *traverse_channel(bNodeSocket *input,
                                    const short target_type,
                                    Vector<bNode *> &group_stack)
@@ -1195,38 +1189,35 @@ static bNodeLink *traverse_channel(bNodeSocket *input,
     return input->link;
   }
 
-  /* Descend into a ShaderNodeGroup: bridge from the parent's output socket through to
-   * the corresponding NodeGroupOutput input socket inside the embedded node tree. */
+  /* Descend into a ShaderNodeGroup: continue traversal from the matching socket on the
+   * group's NodeGroupOutput. The fromsock identifier is the stable Blender socket id and
+   * matches between the group node's output and the GroupOutput's mirrored input. */
   if (linked_node->type_legacy == NODE_GROUP && linked_node->id) {
     bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(linked_node->id);
     group_tree->ensure_topology_cache();
-    bNode *group_out = group_tree->group_output_node();
-    if (!group_out) {
-      return nullptr;
-    }
-    const StringRef socket_id = input->link->fromsock->identifier;
-    for (bNodeSocket *sock : group_out->input_sockets()) {
-      if (socket_id == sock->identifier) {
-        group_stack.append(linked_node);
-        bNodeLink *result = traverse_channel(sock, target_type, group_stack);
-        group_stack.pop_last();
-        return result;
+    if (bNode *group_out = group_tree->group_output_node()) {
+      const StringRef fromsock_id = input->link->fromsock->identifier;
+      for (bNodeSocket *inner_sock : group_out->input_sockets()) {
+        if (fromsock_id == inner_sock->identifier) {
+          group_stack.append(linked_node);
+          bNodeLink *result = traverse_channel(inner_sock, target_type, group_stack);
+          group_stack.pop_last();
+          return result;
+        }
       }
     }
     return nullptr;
   }
 
-  /* Ascend out of a ShaderNodeGroup: a NodeGroupInput is a proxy for the parent group
-   * node's inputs. Map fromsock's identifier back to the parent group node's input
-   * socket and continue traversal there. Without a known parent (empty stack) the group
-   * is being inspected standalone — fall through to the generic DFS. */
+  /* Ascend out of a ShaderNodeGroup: a NodeGroupInput proxies the parent group node's inputs.
+   * Without a known parent the group is being inspected standalone — fall through. */
   if (linked_node->type_legacy == NODE_GROUP_INPUT && !group_stack.is_empty()) {
     bNode *parent_group = group_stack.last();
-    const StringRef socket_id = input->link->fromsock->identifier;
-    for (bNodeSocket *sock : parent_group->input_sockets()) {
-      if (socket_id == sock->identifier) {
+    const StringRef fromsock_id = input->link->fromsock->identifier;
+    for (bNodeSocket *outer_sock : parent_group->input_sockets()) {
+      if (fromsock_id == outer_sock->identifier) {
         bNode *popped = group_stack.pop_last();
-        bNodeLink *result = traverse_channel(sock, target_type, group_stack);
+        bNodeLink *result = traverse_channel(outer_sock, target_type, group_stack);
         group_stack.append(popped);
         return result;
       }
@@ -1234,14 +1225,8 @@ static bNodeLink *traverse_channel(bNodeSocket *input,
     return nullptr;
   }
 
-  /* Recursively traverse only the linked node's value-carrying input sockets, so a
-   * texture wired into a modulating socket (Fac, Hue, From Min, etc.) is not picked
-   * up as the source for this channel. Unknown node types yield no value-carrying
-   * inputs and end the traversal. */
+  /* Recursively traverse the linked node's sockets. */
   for (bNodeSocket &sock : linked_node->inputs) {
-    if (!is_value_carrier_input(linked_node, &sock)) {
-      continue;
-    }
     if (bNodeLink *found_link = traverse_channel(&sock, target_type, group_stack)) {
       return found_link;
     }
@@ -1251,6 +1236,14 @@ static bNodeLink *traverse_channel(bNodeSocket *input,
 }
 
 static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
+{
+  Vector<bNode *> group_stack;
+  return traverse_channel(input, target_type, group_stack);
+}
+
+/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
+ * material's node tree.  Returns null if no instance of either type was found. */
+static bNode *find_bsdf_node(Material *material)
 {
   Vector<bNode *> group_stack;
   return traverse_channel(input, target_type, group_stack);
