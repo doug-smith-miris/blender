@@ -685,50 +685,47 @@ NODE_SHADER_MATERIALX_BEGIN
       NodeItem tangent = in["tangent"];
       if (anisotropy) {
         /* Bridge Blender Principled BSDF's anisotropy convention to MaterialX OpenPBR's
-         * `geometry_tangent` axis. Two empirical adjustments are needed:
+         * `geometry_tangent` axis. This must match the lower-level Type::BSDF branch above
+         * because `open_pbr_surface` routes `geometry_tangent` directly to its internal
+         * `dielectric_bsdf.tangent` / `generalized_schlick_bsdf.tangent` sockets (see
+         * libraries/bxdf/open_pbr_surface.mtlx); the same dielectric_bsdf that the
+         * Type::BSDF branch builds explicitly.
          *
-         * 1. Magnitude scaling (`OPENPBR_ANISOTROPY_VISUAL_SCALE`): Cycles squeezes the
-         *    roughness along one axis with `aspect = sqrt(1 - anisotropic * 0.9)`
-         *    (intern/cycles/kernel/svm/closure.h). OpenPBR's
-         *    `specular_roughness_anisotropy` uses a different aspect-ratio mapping, so a
-         *    constant scale was tuned to visually match Cycles in side-by-side renders.
+         * 1. Magnitude scaling (`CYCLES_TO_OPENPBR_ANISOTROPY_SCALE = 0.9`):
+         *    - Cycles uses     `aspect = sqrt(1 - A * 0.9)` with
+         *                      `alpha_x = R²/aspect`, `alpha_y = R²*aspect`
+         *      (intern/cycles/kernel/svm/closure.h:157-164).
+         *    - OpenPBR's `open_pbr_anisotropy` graph (libraries/bxdf/open_pbr_surface.mtlx,
+         *      `NG_open_pbr_anisotropy`) computes
+         *                      `alpha_x = R² * sqrt(2/((1-A')²+1))`,
+         *                      `alpha_y = (1-A') * alpha_x`,
+         *      giving an alpha_x/alpha_y ratio of `1/(1-A')`. Matching Cycles' ratio
+         *      `1/(1-A*0.9)` yields `A' = A * 0.9` — an exact, derived match (not an
+         *      empirical 0.7 fudge factor).
          *
-         * 2. Axis rotation (`OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG` + negation):
-         *    - Blender Principled BSDF (Cycles): `T' = rotate_around_axis(T, N, rot * 2π)`
-         *      with `rot = 0` putting the highlight perpendicular to T (along the
-         *      bitangent B = N × T) — see closure.h:167.
-         *    - OpenPBR `geometry_tangent`: the input vector is itself the primary axis
-         *      along which roughness is elongated. So with `rot = 0` and an unrotated T,
-         *      OpenPBR would elongate along T while Cycles elongates along B — a
-         *      90° mismatch. The fixed `+90°` rotates Blender's T to the bitangent so
-         *      the `rot = 0` highlights match.
-         *    - The leading negation flips rotation direction: Cycles' `rotate_around_axis`
-         *      rotates counter-clockwise when viewed from `+N`, while MaterialX
-         *      `rotate3d`'s right-handed rotation about `N` produces the opposite visual
-         *      direction once the resulting vector becomes OpenPBR's anisotropy axis.
+         * 2. Tangent rotation (`anisotropic_rotation * 360`, no offset, no negation):
+         *    - Cycles                : `T' = rotate_around_axis(T, N, rot * 2π)` — same
+         *                              axis (N) and same right-handed direction.
+         *    - MaterialX `rotate3d`  : `rotate3d(in, amount_deg, axis)` — right-handed
+         *                              about `axis`. Same handedness as Cycles, so no
+         *                              negation is required.
+         *    - The `+90°` offset previously applied was incorrect: OpenPBR's
+         *      `geometry_tangent` is the same vector that `dielectric_bsdf` would receive
+         *      from the Type::BSDF path, where the lower-level emitter uses the clean
+         *      `rot * 360` formula (line 494). A 90° mismatch between the two paths means
+         *      one of them is wrong; correctness requires they agree.
          *
-         * Correctness assumptions, sanity-checked when changing this block:
-         *   - Blender's MaterialX `tangent space=world` node (see node_shader_tangent.cc)
-         *     resolves to the same UV-derived first basis Cycles uses for `T`. UV winding
-         *     order does not invalidate the rotation because both sides consume the same
-         *     UV-derived tangent.
-         *   - When the artist wires an external vector into the Tangent input, that
-         *     vector is rotated under the same convention — i.e. the caller is expected
-         *     to provide a Blender-Principled-style tangent direction.
-         *   - The lower-level MaterialX `BSDF` path above (case NodeItem::Type::BSDF)
-         *     uses a clean `aniso_rot * 360°` rotation with no offset or inversion,
-         *     because `dielectric_bsdf`/`conductor_bsdf` interpret `tangent` directly as
-         *     the rotated Blender tangent — the offset is OpenPBR-specific.
+         * Correctness assumption (unchanged from previous comment): Blender's MaterialX
+         * `<tangent space="world">` node (see node_shader_tangent.cc) resolves to the
+         * same UV-derived first basis Cycles uses for `T`, so a rot=0 highlight aligns
+         * with Cycles' rot=0 highlight without any constant offset.
          */
-        constexpr float OPENPBR_ANISOTROPY_VISUAL_SCALE = 0.7f;
-        constexpr float OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG = 90.0f;
-        constexpr float OPENPBR_ANISOTROPIC_ROTATION_TO_DEG = 360.0f;
+        constexpr float CYCLES_TO_OPENPBR_ANISOTROPY_SCALE = 0.9f;
+        constexpr float ANISOTROPIC_ROTATION_TO_DEG = 360.0f;
 
-        anisotropy = anisotropy * val(OPENPBR_ANISOTROPY_VISUAL_SCALE);
+        anisotropy = anisotropy * val(CYCLES_TO_OPENPBR_ANISOTROPY_SCALE);
 
-        NodeItem rotation = -((in["anisotropic_rotation"] *
-                               val(OPENPBR_ANISOTROPIC_ROTATION_TO_DEG)) +
-                              val(OPENPBR_ANISOTROPY_TANGENT_OFFSET_DEG));
+        NodeItem rotation = in["anisotropic_rotation"] * val(ANISOTROPIC_ROTATION_TO_DEG);
 
         /* Only create a normal node locally if we need to use it to rotate the tangent vector.
          * we don't actually pass this to the exported material. */
