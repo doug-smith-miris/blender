@@ -14,9 +14,19 @@ input with no value and no connection. This test exports the real swarmfish-v001
 with generate_materialx_network=True and asserts no Shader prim is left without an
 info:id, while the three MaterialX surface arcs survive.
 
+It additionally locks the *renderer-level* invariant the structural symptom maps to:
+Karma's `Error 1067: Reference to undefined variable` is, structurally, a UsdShade
+`.connect` whose target attribute does not resolve to an existing prim. So we walk
+every connection on every connectable prim and assert none dangles — the structural
+equivalent of "Karma compiles the network clean". This catches a future regression
+that leaves a dangling reference even if it happens to author a non-empty info:id,
+which the info:id-only check would miss.
+
 Run:
   <patched-blender> --background <swarmfish-v001.blend> --python this_script.py
-Regression sentinel: stock Blender 5.1.1 leaves 3 Shader prims with no info:id.
+Regression sentinel (stock Blender): 2-3 Shader prims with no info:id AND the network
+is connection-inconsistent; the matching Karma husk render logs `Error 1067` and the
+isolated eye renders flat grey instead of shaded yellow with a dark pupil.
 """
 import bpy
 import os
@@ -81,15 +91,41 @@ def validate():
     for name, tgt in sorted(mtlx_arcs.items()):
         print(f"  {name} -> {tgt}")
 
+    # Connection consistency: every UsdShade connection must resolve to a prim that
+    # exists on the stage. A dangling connection is exactly what makes Karma abort
+    # with Error 1067 ("Reference to undefined variable"), so this is the structural
+    # proxy for "the network compiles".
+    dangling = []
+    total_conns = 0
+    for prim in stage.Traverse():
+        connectable = UsdShade.ConnectableAPI(prim)
+        if not connectable:
+            continue
+        for shade_attr in list(connectable.GetInputs()) + list(connectable.GetOutputs()):
+            for tgt in shade_attr.GetAttr().GetConnections():
+                total_conns += 1
+                target_prim = stage.GetPrimAtPath(tgt.GetPrimPath())
+                if not target_prim or not target_prim.IsValid():
+                    dangling.append(f"{shade_attr.GetAttr().GetPath()} -> {tgt}")
+    print(f"TOTAL_CONNECTIONS={total_conns}")
+    print(f"DANGLING_CONNECTIONS={len(dangling)}")
+    for d in dangling[:20]:
+        print(f"  dangling: {d}")
+
     assert len(missing_id) == 0, (
         f"{len(missing_id)} Shader prim(s) left without info:id (phantom nodedef stubs): "
         f"{missing_id}"
+    )
+    assert len(dangling) == 0, (
+        f"{len(dangling)} dangling UsdShade connection(s) (Karma Error 1067 trigger): "
+        f"{dangling[:20]}"
     )
     for expected in ("creature_eyes", "creature_pupil", "creature_BS"):
         assert expected in mtlx_arcs, (
             f"expected MaterialX surface arc on '{expected}' material, got {sorted(mtlx_arcs)}"
         )
-    print("BL_MAT_002_PASS: no phantom nodedef stubs; 3 mtlx surface arcs intact")
+    print("BL_MAT_002_PASS: no phantom nodedef stubs; network connection-consistent "
+          "(no Error 1067); 3 mtlx surface arcs intact")
 
 
 if __name__ == "__main__":
