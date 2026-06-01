@@ -9,15 +9,24 @@
 #include "usd_writer_material.hh"
 
 #include <pxr/base/tf/stringUtils.h>
+#include <pxr/usd/usdShade/input.h>
+#include <pxr/usd/usdShade/shader.h>
 #include <pxr/usd/usdGeom/bboxCache.h>
 #include <pxr/usd/usdGeom/scope.h>
 #include <pxr/usd/usdUI/accessibilityAPI.h>
 
 #include "BLI_assert.h"
 #include "BLI_bounds_types.hh"
+#include "BLI_set.hh"
+#include "BLI_string_ref.hh"
+
+#include "BKE_anonymous_attribute_id.hh"
+#include "BKE_attribute.hh"
+#include "BKE_object.hh"
 
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
+#include "DNA_object_types.h"
 
 #include "WM_types.hh"
 
@@ -102,14 +111,42 @@ static void write_accessibility_property(const pxr::UsdPrim &prim,
   }
 }
 
-static std::string get_mesh_active_uvlayer_name(const Object *ob)
+/* Return the name of the UV map that the material writer should treat as the
+ * default texture-coordinate set for this object.
+ *
+ * This MUST match the UV map that USDGenericMeshWriter::write_uv_data renames to
+ * "st" (when params.rename_uvmaps is enabled), otherwise UsdPrimvarReader_float2
+ * shaders end up pointing at a primvar name that no longer exists on the
+ * geometry. Two things have to line up with the mesh writer:
+ *
+ *   1. The mesh writer keys its rename off Mesh::default_uv_map_name() (the
+ *      *render* UV map), not Mesh::active_uv_map_name() (the editor-selected one).
+ *   2. The mesh writer operates on the fully *evaluated* mesh. Geometry-Nodes
+ *      networks can author a render UV map that only exists post-evaluation
+ *      (e.g. swarmfish's creature_body, whose render UV map is "Alignment"),
+ *      while ob->data (the original mesh datablock) carries only the authored
+ *      UV maps. Reading ob->data here would miss that name, the rename-to-"st"
+ *      condition would never fire, and the reader would dangle on "Alignment"
+ *      while the geometry primvar was renamed to "st" (BL-MAT-004).
+ *
+ * So resolve the evaluated mesh first and fall back to ob->data only if the
+ * object has no evaluated mesh. */
+static std::string get_mesh_default_uvlayer_name(const Object *ob)
 {
-  if (!ob || ob->type != OB_MESH || !ob->data) {
+  if (!ob || ob->type != OB_MESH) {
     return "";
   }
 
-  const Mesh *mesh = id_cast<Mesh *>(ob->data);
-  return mesh->active_uv_map_name();
+  if (const Mesh *mesh_eval = BKE_object_get_evaluated_mesh(ob)) {
+    return mesh_eval->default_uv_map_name();
+  }
+
+  if (ob->data) {
+    const Mesh *mesh = id_cast<Mesh *>(ob->data);
+    return mesh->default_uv_map_name();
+  }
+
+  return "";
 }
 
 template<typename USDT>
@@ -291,6 +328,88 @@ pxr::SdfPath USDAbstractWriter::get_proto_material_root_path(const HierarchyCont
   return pxr::SdfPath(path_prefix + material_library_path);
 }
 
+/* BL-MAT-004: A material's UsdPrimvarReader_float2 shaders carry a `varname` taken from
+ * the Blender UV Map node. If that node references a UV map that is not present on the
+ * bound geometry (e.g. swarmfish's creature_body, whose UV Map node names "Alignment"
+ * while the mesh's only UV map is the default "UVMap"), Blender silently falls back to the
+ * default UV map at render time -- but the exporter emits the dangling name verbatim, so
+ * USD/MaterialX renderers that require the standard "st" name resolve nothing.
+ *
+ * After the preview-surface network is built, retarget any UV reader whose varname does
+ * not match a UV primvar actually authored on the geometry to the default UV set ("st"
+ * when rename_uvmaps is enabled). Readers that point at a real (secondary) UV map -- one
+ * present in the authored set -- are left untouched. */
+static void retarget_dangling_uv_readers(const pxr::UsdShadeMaterial &usd_material,
+                                         const Object *ob,
+                                         const USDExportParams &params)
+{
+  if (!params.rename_uvmaps || !usd_material || !ob || ob->type != OB_MESH) {
+    return;
+  }
+
+  const Mesh *mesh = BKE_object_get_evaluated_mesh(ob);
+  if (!mesh && ob->data) {
+    mesh = id_cast<Mesh *>(ob->data);
+  }
+  if (!mesh) {
+    return;
+  }
+
+  const StringRefNull default_name = mesh->default_uv_map_name();
+
+  /* Build the set of UV primvar names actually authored on the geometry, mirroring
+   * USDGenericMeshWriter::write_uv_data: every Corner-domain Float2 attribute is exported
+   * as a UV primvar, and the default (render) UV map is renamed to "st". */
+  Set<std::string> authored_uv_names;
+  const bke::AttributeAccessor attributes = mesh->attributes();
+  attributes.foreach_attribute([&](const bke::AttributeIter &iter) {
+    if (iter.domain != bke::AttrDomain::Corner || iter.data_type != bke::AttrType::Float2) {
+      return;
+    }
+    if (iter.name.is_empty() || iter.name[0] == '.' ||
+        bke::attribute_name_is_anonymous(iter.name))
+    {
+      return;
+    }
+    const std::string emitted = (iter.name == default_name) ? std::string("st") :
+                                                              std::string(iter.name);
+    authored_uv_names.add(make_safe_primvar_name(emitted, params.allow_unicode));
+  });
+
+  /* Only retarget when the standard default set "st" is actually present; otherwise we
+   * have no unambiguous target and leave the network alone. */
+  const std::string fallback = "st";
+  if (!authored_uv_names.contains(fallback)) {
+    return;
+  }
+
+  static const pxr::TfToken primvar_reader_float2("UsdPrimvarReader_float2",
+                                                  pxr::TfToken::Immortal);
+  static const pxr::TfToken varname_tok("varname", pxr::TfToken::Immortal);
+
+  for (const pxr::UsdPrim &prim : usd_material.GetPrim().GetDescendants()) {
+    const pxr::UsdShadeShader shader(prim);
+    if (!shader) {
+      continue;
+    }
+    pxr::TfToken id;
+    if (!shader.GetIdAttr().Get(&id) || id != primvar_reader_float2) {
+      continue;
+    }
+    pxr::UsdShadeInput varname_input = shader.GetInput(varname_tok);
+    if (!varname_input) {
+      continue;
+    }
+    std::string current;
+    if (!varname_input.Get(&current)) {
+      continue;
+    }
+    if (!authored_uv_names.contains(current)) {
+      varname_input.Set(fallback);
+    }
+  }
+}
+
 pxr::UsdShadeMaterial USDAbstractWriter::ensure_usd_material_created(
     const HierarchyContext &context, Material *material) const
 {
@@ -307,10 +426,13 @@ pxr::UsdShadeMaterial USDAbstractWriter::ensure_usd_material_created(
     return usd_material;
   }
 
-  std::string active_uv = get_mesh_active_uvlayer_name(context.object);
+  std::string active_uv = get_mesh_default_uvlayer_name(context.object);
 
   usd_material = create_usd_material(
       usd_export_context_, usd_path, material, active_uv, reports());
+
+  /* BL-MAT-004: fix up UV readers that reference a UV map absent from the bound geometry. */
+  retarget_dangling_uv_readers(usd_material, context.object, usd_export_context_.export_params);
 
   auto prim = usd_material.GetPrim();
   add_to_prim_map(prim.GetPath(), &material->id);
