@@ -467,7 +467,7 @@ void USDGenericMeshWriter::write_mesh(HierarchyContext &context,
   write_subdiv(subdiv_scheme, usd_mesh, subsurfData);
 
   if (usd_export_context_.export_params.export_materials) {
-    assign_materials(context, usd_mesh, usd_mesh_data.face_groups);
+    assign_materials(context, mesh, usd_mesh, usd_mesh_data.face_groups);
   }
 }
 
@@ -626,12 +626,30 @@ void USDGenericMeshWriter::get_geometry_data(const Mesh *mesh, USDMeshData &usd_
 }
 
 void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
+                                            const Mesh *mesh,
                                             const pxr::UsdGeomMesh &usd_mesh,
                                             const MaterialFaceGroups &usd_face_groups)
 {
-  if (context.object->totcol == 0) {
+  /* Geometry-Nodes-realized meshes can carry materials in `mesh->mat[]` that are not
+   * exposed in `object->mat[]` (e.g. via the "Set Material" GN node). Consult the
+   * higher of the two slot counts so those materials reach the USD binding. */
+  const int data_slots_num = mesh && mesh->totcol > 0 ? mesh->totcol : 0;
+  const int total_slots_num = std::max<int>(context.object->totcol, data_slots_num);
+  if (total_slots_num == 0) {
     return;
   }
+
+  auto get_material_for_slot = [&](const int slot_num) -> Material * {
+    if (slot_num < context.object->totcol) {
+      if (Material *material = BKE_object_material_get(context.object, slot_num + 1)) {
+        return material;
+      }
+    }
+    if (mesh && slot_num < mesh->totcol && mesh->mat) {
+      return mesh->mat[slot_num];
+    }
+    return nullptr;
+  };
 
   /* Binding a material to a geometry subset isn't supported by the Hydra GL viewport yet,
    * which is why we always bind the first material to the entire mesh. See
@@ -639,8 +657,8 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
   bool mesh_material_bound = false;
   auto mesh_prim = usd_mesh.GetPrim();
   pxr::UsdShadeMaterialBindingAPI material_binding_api(mesh_prim);
-  for (int mat_num = 0; mat_num < context.object->totcol; mat_num++) {
-    Material *material = BKE_object_material_get(context.object, mat_num + 1);
+  for (int mat_num = 0; mat_num < total_slots_num; mat_num++) {
+    Material *material = get_material_for_slot(mat_num);
     if (material == nullptr) {
       continue;
     }
@@ -680,7 +698,7 @@ void USDGenericMeshWriter::assign_materials(const HierarchyContext &context,
     short material_number = face_group.key;
     const pxr::VtIntArray &face_indices = face_group.value;
 
-    Material *material = BKE_object_material_get(context.object, material_number + 1);
+    Material *material = get_material_for_slot(material_number);
     if (material == nullptr) {
       continue;
     }

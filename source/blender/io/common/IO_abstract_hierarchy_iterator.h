@@ -26,9 +26,11 @@
 #include "BLI_map.hh"
 #include "BLI_math_matrix_types.hh"
 #include "BLI_set.hh"
+#include "BLI_vector.hh"
 
 #include "DEG_depsgraph.hh"
 
+#include <memory>
 #include <string>
 
 namespace blender {
@@ -39,6 +41,10 @@ struct ID;
 struct Main;
 struct Object;
 struct ParticleSystem;
+
+namespace bke {
+struct ObjectRuntime;
+}
 
 namespace io {
 
@@ -254,6 +260,13 @@ class AbstractHierarchyIterator {
   ExportSubset export_subset_;
   DupliSources duplisources_;
   ExportUsedNameMap used_names_;
+
+  /* Heap-allocated shallow-copy Objects + ObjectRuntimes used to expose
+   * Geometry-Nodes-realized dupli data (`DupliObject::ob_data`) with the correct
+   * object type and data pointer for downstream writers. Lifetime matches
+   * `export_graph_` (cleared in `export_graph_clear()`). */
+  Vector<std::unique_ptr<Object>> dupli_shallow_objects_;
+  Vector<std::unique_ptr<bke::ObjectRuntime>> dupli_shallow_runtimes_;
 
  public:
   explicit AbstractHierarchyIterator(Main *bmain, Depsgraph *depsgraph);
