@@ -28,6 +28,7 @@
 #include "BLI_map.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_set.hh"
+#include "BLI_span.hh"
 #include "BLI_string.h"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utils.hh"
@@ -1155,98 +1156,22 @@ static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
   return nullptr;
 }
 
-/* Forward decl: find_connected_bsdf and find_bsdf_via_group_output recurse mutually. */
-static bNode *find_connected_bsdf(const bNodeSocket *socket);
-
-/* When upstream traversal reaches a ShaderNodeGroup, descend into the group's
- * inner node tree and continue walking from the matching NodeGroupOutput input
- * socket. Returns null if the group is broken, has no active NodeGroupOutput,
- * or has no matching internal socket.
+/* Recursively searches a node tree -- descending into any nested node groups -- for the first
+ * node whose legacy type is one of `node_types`. Returns null if none is found.
  *
- * Why this matters (BL-MAT-shadernodegroup-output-empty-prim): artists
- * routinely wrap shader networks in a node group and only expose a single
- * Surface output. The Principled BSDF then lives inside the group, not in the
- * material's top-level node tree. Before this descent, `find_connected_bsdf`
- * stopped at the group boundary (since its `inputs` are the external interface,
- * not the inner graph), and the legacy `all_nodes()` fallback only scans the
- * top-level tree — so `find_bsdf_node` returned null and the exporter emitted
- * an empty `def Material "name" {}` with zero Shader descendants. */
-static bNode *find_bsdf_via_group_output(const bNode *group_node,
-                                         const bNodeSocket *external_out)
+ * Descending into groups is required for AYON-style materials (e.g. swarmfish
+ * `creature_eyes` / `creature_pupil`) whose shader network is wrapped in a #ShaderNodeGroup
+ * that exposes only a Surface output. Such a group node is the only top-level node feeding
+ * Material Output, so a flat scan of the material's node tree never reaches the BSDF and the
+ * UsdPreviewSurface writer would emit an empty `def Material {}` prim. */
+static bNode *find_node_of_type_recursive(bNodeTree *ntree, const blender::Span<int> node_types)
 {
-  if (!group_node || !external_out) {
+  if (!ntree) {
     return nullptr;
-  }
-  bNodeTree *inner = reinterpret_cast<bNodeTree *>(group_node->id);
-  if (!inner) {
-    return nullptr;
-  }
-  inner->ensure_topology_cache();
-  const bNode *group_output_node = inner->group_output_node();
-  if (!group_output_node) {
-    return nullptr;
-  }
-  /* External outputs on a Group node and the internal NodeGroupOutput's input
-   * sockets share identifiers across the interface — match by identifier so we
-   * are robust to virtual extension sockets and reordering. */
-  for (const bNodeSocket &internal_in : group_output_node->inputs) {
-    if (STREQ(internal_in.identifier, external_out->identifier)) {
-      return find_connected_bsdf(&internal_in);
-    }
-  }
-  return nullptr;
-}
-
-/* Walk upstream from the given socket through pass-through nodes (reroutes, Mix Shader,
- * Add Shader, etc.) and return the first connected Principled/Diffuse BSDF, or null.
- * Descends into ShaderNodeGroup nodes via find_bsdf_via_group_output. */
-static bNode *find_connected_bsdf(const bNodeSocket *socket)
-{
-  if (!socket || !socket->link || !socket->link->fromnode) {
-    return nullptr;
-  }
-  bNode *from = socket->link->fromnode;
-  if (ELEM(from->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
-    return from;
-  }
-  if (from->is_group()) {
-    /* The external `inputs` of a group node are values flowing IN, not the
-     * graph that produced the upstream output we are tracing — so do NOT fall
-     * through to the generic input-iteration after descending. */
-    return find_bsdf_via_group_output(from, socket->link->fromsock);
-  }
-  for (const bNodeSocket &sock : from->inputs) {
-    if (bNode *found = find_connected_bsdf(&sock)) {
-      return found;
-    }
-  }
-  return nullptr;
-}
-
-/* Returns the Principled or Diffuse BSDF that is actually connected to the active
- * Material Output's Surface socket. Falls back to the legacy first-match scan when no
- * connected BSDF can be found (e.g. when the chain enters a Group node — that is
- * BL-MAT-NG-001's territory, handled by a separate bite).
- *
- * Why this matters: artists frequently leave disconnected "ghost" Principled BSDF nodes
- * in the graph (leftover from material iteration). The previous implementation grabbed
- * the first one it saw in `all_nodes()` — even if the Surface output was actually wired
- * to a different shader entirely. That misattributed the wrong defaults onto the exported
- * UsdPreviewSurface. */
-static bNode *find_bsdf_node(Material *material)
-{
-  if (bNodeTree *ntree = material->nodetree) {
-    if (bNode *output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_ALL)) {
-      if (bNodeSocket *surface = bke::node_find_socket(*output, SOCK_IN, "Surface"_ustr)) {
-        if (bNode *bsdf = find_connected_bsdf(surface)) {
-          return bsdf;
-        }
-      }
-    }
   }
 
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
+  for (bNode *node : ntree->all_nodes()) {
+    if (node_types.contains(node->type_legacy)) {
       return node;
     }
     if (node->type_legacy == NODE_GROUP && node->id) {
@@ -1256,34 +1181,38 @@ static bNode *find_bsdf_node(Material *material)
       }
     }
   }
-  return nullptr;
-}
 
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree, descending into any nested ShaderNodeGroups. Returns null if no
- * instance of either type was found. */
-static bNode *find_bsdf_node(Material *material)
-{
-  if (!material || !material->nodetree) {
-    return nullptr;
-  }
-  return find_bsdf_node_in_tree(material->nodetree);
-}
-
-/**
- * Returns the first occurrence of a scalar Displacement node found in the given
- * material's node tree. Vector Displacement is not supported in the #UsdPreviewSurface.
- * Returns null if no instance of either type was found.
- */
-static bNode *find_displacement_node(Material *material)
-{
-  for (bNode *node : material->nodetree->all_nodes()) {
-    if (node->type_legacy == SH_NODE_DISPLACEMENT) {
-      return node;
+  /* No match at this level: descend into node groups. */
+  for (bNode *node : ntree->all_nodes()) {
+    if (node->is_group()) {
+      if (bNode *found = find_node_of_type_recursive(reinterpret_cast<bNodeTree *>(node->id),
+                                                     node_types))
+      {
+        return found;
+      }
     }
   }
 
   return nullptr;
+}
+
+/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
+ * material's node tree (including inside nested node groups).  Returns null if no instance of
+ * either type was found. */
+static bNode *find_bsdf_node(Material *material)
+{
+  return find_node_of_type_recursive(material->nodetree,
+                                     {SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE});
+}
+
+/**
+ * Returns the first occurrence of a scalar Displacement node found in the given
+ * material's node tree (including inside nested node groups). Vector Displacement is not
+ * supported in the #UsdPreviewSurface. Returns null if no instance of either type was found.
+ */
+static bNode *find_displacement_node(Material *material)
+{
+  return find_node_of_type_recursive(material->nodetree, {SH_NODE_DISPLACEMENT});
 }
 
 /* Creates a USD Preview Surface shader based on the given cycles node name and type. */
