@@ -6,6 +6,8 @@
  * \ingroup shdnodes
  */
 
+#include <algorithm>
+
 #include "node_shader_util.hh"
 
 #include "BKE_colortools.hh"
@@ -310,8 +312,83 @@ static void sh_node_curve_rgb_build_multi_function(NodeMultiFunctionBuilder &bui
 NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
-  /* TODO: implement */
-  return get_input_value("Color", NodeItem::Type::Color3);
+  /* MaterialX 1.39's standard library has no native arbitrary-curve node
+   * (curveadjust / curvelookup are proposals, not in stdlib_defs.mtlx), so
+   * approximate the four-curve transform as a per-channel piecewise-linear
+   * function built out of clamp/add/multiply/ifgreatereq nodes. The
+   * composition mirrors BKE_curvemapping_evaluateRGBF:
+   *     y_c = curve_c( curve_combined(x_c) )
+   * with cm[3] = Combined and cm[0..2] = R/G/B. N segments / N+1 anchor
+   * samples per channel; N = 8 keeps fidelity to <~1% on smooth artist
+   * curves while keeping the emitted graph manageable. */
+  CurveMapping *cumap = static_cast<CurveMapping *>(node_->storage);
+
+  NodeItem fac = get_input_value("Fac", NodeItem::Type::Float);
+  NodeItem color = get_input_value("Color", NodeItem::Type::Color3);
+
+  if (cumap == nullptr) {
+    /* Should never happen — storage is allocated in node_shader_init_curve_rgb —
+     * but if it ever does, the previous passthrough is the safest fallback. */
+    return color;
+  }
+  BKE_curvemapping_init(cumap);
+
+  /* If all four curves are identity, the node is a no-op. Return the input
+   * directly so the emitted MaterialX graph stays clean. */
+  if (BKE_curvemapping_is_map_identity(cumap, 0) &&
+      BKE_curvemapping_is_map_identity(cumap, 1) &&
+      BKE_curvemapping_is_map_identity(cumap, 2) &&
+      BKE_curvemapping_is_map_identity(cumap, 3))
+  {
+    return color;
+  }
+
+  constexpr int N = 8;
+
+  auto sample_channel = [&](int c, float x) -> float {
+    const float xc = std::clamp(x, 0.0f, 1.0f);
+    const float v_combined = BKE_curvemap_evaluateF(cumap, &cumap->cm[3], xc);
+    return BKE_curvemap_evaluateF(cumap, &cumap->cm[c], v_combined);
+  };
+
+  auto build_pwl_channel = [&](int c, NodeItem x) -> NodeItem {
+    float y[N + 1];
+    for (int i = 0; i <= N; i++) {
+      y[i] = sample_channel(c, float(i) / float(N));
+    }
+    const float inv_step = float(N);
+
+    /* Segment 0 (covers x in [0, 1/N]): linear from (0, y[0]) to (1/N, y[1]).
+     * x_0 = 0 so the formula simplifies to y[0] + slope*x. Subsequent
+     * segments are layered via ifgreatereq, so the chain naturally
+     * extrapolates linearly past x = 1 using segment N-1's slope. */
+    NodeItem result = val(y[0]) + val((y[1] - y[0]) * inv_step) * x;
+    for (int i = 1; i < N; i++) {
+      const float x_i = float(i) / float(N);
+      NodeItem seg = val(y[i]) + val((y[i + 1] - y[i]) * inv_step) * (x - val(x_i));
+      result = x.if_else(NodeItem::CompareOp::GreaterEq, val(x_i), seg, result);
+    }
+    return result;
+  };
+
+  /* Skip building a PWL for any channel whose composed curve is identity
+   * (cm[3] AND cm[c] both identity). This is the common case when only one
+   * channel has been curved. */
+  const bool ident_combined = BKE_curvemapping_is_map_identity(cumap, 3);
+  auto channel_is_identity = [&](int c) -> bool {
+    return ident_combined && BKE_curvemapping_is_map_identity(cumap, c);
+  };
+
+  NodeItem r_out = channel_is_identity(0) ? color[0] : build_pwl_channel(0, color[0]);
+  NodeItem g_out = channel_is_identity(1) ? color[1] : build_pwl_channel(1, color[1]);
+  NodeItem b_out = channel_is_identity(2) ? color[2] : build_pwl_channel(2, color[2]);
+
+  NodeItem curved = create_node(
+      "combine3", NodeItem::Type::Color3, {{"in1", r_out}, {"in2", g_out}, {"in3", b_out}});
+
+  /* CurveRGBFunction.call mixes between the unmodified input and the curved
+   * result by Fac (clamped to [0,1] to mirror the GPU path's behavior). */
+  return fac.clamp().mix(color, curved);
 }
 #endif
 NODE_SHADER_MATERIALX_END
