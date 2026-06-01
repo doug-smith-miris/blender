@@ -43,12 +43,14 @@
 #include "WM_types.hh"
 
 #include <pxr/base/tf/stringUtils.h>
+#include <pxr/base/vt/dictionary.h>
+#include <pxr/usd/sdf/layer.h>
+#include <pxr/usd/usd/primRange.h>
 
 #ifdef WITH_MATERIALX
 #  include "shader/materialx/material.h"
 #  include <MaterialXCore/Node.h>
 #  include <pxr/usd/sdf/copyUtils.h>
-#  include <pxr/usd/usd/primRange.h>
 #  include <pxr/usd/usdMtlx/materialXConfigAPI.h>
 #  include <pxr/usd/usdMtlx/reader.h>
 #  include <pxr/usd/usdMtlx/utils.h>
@@ -2314,6 +2316,71 @@ void propagate_karma_object_rendervisibility(const pxr::UsdShadeMaterial &usd_ma
                                                          /*custom=*/false,
                                                          pxr::SdfVariabilityUniform);
   new_attr.Set(value);
+}
+
+/* Stage-level marker authored on the root layer's customLayerData when this export
+ * contains at least one UsdShadeMaterial whose `outputs:mtlx:surface` is connected
+ * but whose universal `outputs:surface` is not — i.e. a material that ONLY ships a
+ * MaterialX surface description. This happens by default under PR #35 (the legacy
+ * dual-output `UsdPreviewSurface` arc is dead-weight under Karma and any other
+ * MaterialX-capable Hydra delegate, so it is suppressed unless the caller opts
+ * in via `emit_preview_surface_alongside_materialx`), and ALSO whenever the
+ * preview-surface writer's BSDF search returns null (some critter materials such
+ * as `inner_blue` remain mtlx-only even with the opt-in flag — see PR #35 caveat).
+ *
+ * Downstream consumers without MaterialX support (older Hydra Storm, certain
+ * Omniverse builds) silently lose all shading on such materials at render time.
+ * Authoring this marker lets pipeline tooling detect that condition cheaply
+ * (no shader-graph traversal required) and warn the user or route to a
+ * MaterialX-aware renderer. */
+void author_materialx_required_marker(const pxr::UsdStageRefPtr &stage)
+{
+  if (!stage) {
+    return;
+  }
+
+  static const pxr::TfToken mtlx_render_context("mtlx");
+  bool has_mtlx_only_material = false;
+
+  for (const pxr::UsdPrim &prim : stage->Traverse()) {
+    if (!prim.IsA<pxr::UsdShadeMaterial>()) {
+      continue;
+    }
+    pxr::UsdShadeMaterial mat(prim);
+
+    pxr::UsdShadeOutput mtlx_surf = mat.GetSurfaceOutput(mtlx_render_context);
+    if (!mtlx_surf) {
+      continue;
+    }
+    pxr::SdfPathVector mtlx_conn;
+    if (!mtlx_surf.GetAttr().GetConnections(&mtlx_conn) || mtlx_conn.empty()) {
+      continue;
+    }
+
+    /* MaterialX surface is wired. Check whether the universal arc is also wired. */
+    pxr::UsdShadeOutput univ_surf = mat.GetSurfaceOutput();
+    pxr::SdfPathVector univ_conn;
+    const bool univ_connected = univ_surf &&
+                                univ_surf.GetAttr().GetConnections(&univ_conn) &&
+                                !univ_conn.empty();
+
+    if (!univ_connected) {
+      has_mtlx_only_material = true;
+      break;
+    }
+  }
+
+  if (!has_mtlx_only_material) {
+    return;
+  }
+
+  pxr::SdfLayerHandle root_layer = stage->GetRootLayer();
+  if (!root_layer) {
+    return;
+  }
+  pxr::VtDictionary custom_data = root_layer->GetCustomLayerData();
+  custom_data["miris:requiresMaterialX"] = pxr::VtValue(true);
+  root_layer->SetCustomLayerData(custom_data);
 }
 
 }  // namespace io::usd

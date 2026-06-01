@@ -88,5 +88,18 @@ std::string get_tex_image_asset_filepath(const std::string &asset_path,
 void propagate_karma_object_rendervisibility(const pxr::UsdShadeMaterial &usd_material,
                                              const pxr::UsdPrim &bound_prim);
 
+/**
+ * Stamp `customLayerData["miris:requiresMaterialX"] = true` on the root layer when
+ * at least one UsdShadeMaterial in the stage has a connected `outputs:mtlx:surface`
+ * but no connected `outputs:surface`. Such "mtlx-only" materials appear by default
+ * since PR #35 (BL-MAT-MATX-SHADOWS-PREVIEWSURFACE) suppressed the dead-weight
+ * UsdPreviewSurface arc; they also slip through whenever the preview-surface writer
+ * can't reach a BSDF from the active Material Output regardless of the opt-in flag.
+ * The marker lets downstream tools (older Hydra Storm, certain Omniverse builds)
+ * detect that this layer requires a MaterialX-capable renderer to resolve shading.
+ * No-op when every Material with a MaterialX surface also authors the universal arc.
+ */
+void author_materialx_required_marker(const pxr::UsdStageRefPtr &stage);
+
 }  // namespace io::usd
 }  // namespace blender
