@@ -530,12 +530,21 @@ NODE_SHADER_MATERIALX_BEGIN
         n_coat_bsdf.set_input("tangent", n_coat_tangent);
       }
 
+      /* Thin-film interference: MaterialX 1.39 stdlib has no `thin_film_bsdf` node —
+       * `dielectric_bsdf` / `conductor_bsdf` instead expose `thinfilm_thickness` and
+       * `thinfilm_ior` inputs that integrate the interference directly into the surface
+       * BSDF (this is how `standard_surface.mtlx` / `open_pbr_surface.mtlx` are wired,
+       * see pbrlib_defs.mtlx). Previously the writer emitted a `<thin_film_bsdf>` node
+       * wrapped in a `<layer>`; UsdMtlxRead resolves no NodeDef for it and drops both,
+       * so the thin-film contribution was silently lost (and Karma's MaterialX compiler
+       * aborted with Error 1067 until PR #5/#11/#17/#26 added prune+bypass passes).
+       * Faithfully wire the thin-film parameters onto the existing dielectric/conductor
+       * BSDFs and remove the dropped `thin_film_bsdf` + `layer` pair entirely. When the
+       * source thickness is 0 (the Principled default) the BSDF input defaults are also
+       * 0 so this is a no-op for the common case; non-default values now survive export
+       * and render correctly. */
       NodeItem thin_film_thickness = in["thin_film_thickness"];
       NodeItem thin_film_ior = in["thin_film_IOR"];
-      NodeItem n_thin_film_bsdf = create_node(
-          "thin_film_bsdf",
-          NodeItem::Type::BSDF,
-          {{"thickness", thin_film_thickness}, {"ior", thin_film_ior}});
 
       NodeItem n_artistic_ior = create_node(
           "artistic_ior",
@@ -559,6 +568,8 @@ NODE_SHADER_MATERIALX_BEGIN
                                           {{"ior", n_ior_out},
                                            {"extinction", n_extinction_out},
                                            {"roughness", n_main_roughness},
+                                           {"thinfilm_thickness", thin_film_thickness},
+                                           {"thinfilm_ior", thin_film_ior},
                                            {"normal", normal},
                                            {"tangent", n_main_tangent}});
 
@@ -569,6 +580,8 @@ NODE_SHADER_MATERIALX_BEGIN
                                               {"ior", ior},
                                               {"scatter_mode", val(std::string("R"))},
                                               {"roughness", n_main_roughness},
+                                              {"thinfilm_thickness", thin_film_thickness},
+                                              {"thinfilm_ior", thin_film_ior},
                                               {"normal", normal},
                                               {"tangent", n_main_tangent}});
 
@@ -585,6 +598,8 @@ NODE_SHADER_MATERIALX_BEGIN
                                                  {{"tint", base_color},
                                                   {"ior", ior},
                                                   {"roughness", n_transmission_roughness},
+                                                  {"thinfilm_thickness", thin_film_thickness},
+                                                  {"thinfilm_ior", thin_film_ior},
                                                   {"normal", normal},
                                                   {"tangent", n_main_tangent}});
 
@@ -655,15 +670,14 @@ NODE_SHADER_MATERIALX_BEGIN
 
       NodeItem n_metalness_mix = in["metallic"].mix(n_specular_layer, n_metal_bsdf);
 
-      NodeItem n_thin_film_layer = create_node(
-          "layer", NodeItem::Type::BSDF, {{"top", n_thin_film_bsdf}, {"base", n_metalness_mix}});
-
+      /* Thin film is now baked into the dielectric/conductor BSDFs above, so the metalness
+       * mix is what the coat layers over directly. */
       NodeItem n_coat_attenuation = coat.mix(val(MaterialX::Color3(1.0f, 1.0f, 1.0f)),
                                              in["coat_tint"]);
 
       res = create_node("layer",
                         NodeItem::Type::BSDF,
-                        {{"top", n_coat_bsdf}, {"base", n_thin_film_layer * n_coat_attenuation}});
+                        {{"top", n_coat_bsdf}, {"base", n_metalness_mix * n_coat_attenuation}});
       break;
     }
 
