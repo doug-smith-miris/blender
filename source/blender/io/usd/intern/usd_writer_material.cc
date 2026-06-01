@@ -18,6 +18,8 @@
 #include "BKE_node_runtime.hh"
 #include "BKE_report.hh"
 
+#include "NOD_shader.h"
+
 #include "IMB_colormanagement.hh"
 #include "IMB_imbuf.hh"
 
@@ -1236,29 +1238,48 @@ static bNodeLink *traverse_channel(bNodeSocket *input,
   return nullptr;
 }
 
-static bNodeLink *traverse_channel(bNodeSocket *input, const short target_type)
+/* Walk upstream from the given socket through pass-through nodes (reroutes, Mix Shader,
+ * Add Shader, etc.) and return the first connected Principled/Diffuse BSDF, or null. */
+static bNode *find_connected_bsdf(const bNodeSocket *socket)
 {
-  Vector<bNode *> group_stack;
-  return traverse_channel(input, target_type, group_stack);
-}
-
-/* Returns the first occurrence of a principled BSDF or a diffuse BSDF node found in the given
- * material's node tree.  Returns null if no instance of either type was found. */
-static bNode *find_bsdf_node(Material *material)
-{
-  Vector<bNode *> group_stack;
-  return traverse_channel(input, target_type, group_stack);
-}
-
-/* Recursive helper used by find_bsdf_node: search ntree for a Principled or Diffuse BSDF,
- * descending into nested ShaderNodeGroups so groups that wrap the BSDF are still found. */
-static bNode *find_bsdf_node_in_tree(bNodeTree *ntree)
-{
-  if (!ntree) {
+  if (!socket || !socket->link || !socket->link->fromnode) {
     return nullptr;
   }
-  ntree->ensure_topology_cache();
-  for (bNode *node : ntree->all_nodes()) {
+  bNode *from = socket->link->fromnode;
+  if (ELEM(from->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
+    return from;
+  }
+  for (const bNodeSocket &sock : from->inputs) {
+    if (bNode *found = find_connected_bsdf(&sock)) {
+      return found;
+    }
+  }
+  return nullptr;
+}
+
+/* Returns the Principled or Diffuse BSDF that is actually connected to the active
+ * Material Output's Surface socket. Falls back to the legacy first-match scan when no
+ * connected BSDF can be found (e.g. when the chain enters a Group node — that is
+ * BL-MAT-NG-001's territory, handled by a separate bite).
+ *
+ * Why this matters: artists frequently leave disconnected "ghost" Principled BSDF nodes
+ * in the graph (leftover from material iteration). The previous implementation grabbed
+ * the first one it saw in `all_nodes()` — even if the Surface output was actually wired
+ * to a different shader entirely. That misattributed the wrong defaults onto the exported
+ * UsdPreviewSurface. */
+static bNode *find_bsdf_node(Material *material)
+{
+  if (bNodeTree *ntree = material->nodetree) {
+    if (bNode *output = ntreeShaderOutputNode(ntree, SHD_OUTPUT_ALL)) {
+      if (bNodeSocket *surface = bke::node_find_socket(*output, SOCK_IN, "Surface"_ustr)) {
+        if (bNode *bsdf = find_connected_bsdf(surface)) {
+          return bsdf;
+        }
+      }
+    }
+  }
+
+  for (bNode *node : material->nodetree->all_nodes()) {
     if (ELEM(node->type_legacy, SH_NODE_BSDF_PRINCIPLED, SH_NODE_BSDF_DIFFUSE)) {
       return node;
     }
