@@ -166,7 +166,13 @@ NODE_SHADER_MATERIALX_BEGIN
    * compound MaterialX networks that aren't covered by this bite — those fall through and
    * the writer will emit a warning. See translation-mapping.md. */
   if (node_->custom1 != MA_RAMP_BLEND) {
-    CLOG_WARN(LOG_IO_MATERIALX,
+    /* LOG_IO_MATERIALX lives in `blender::nodes::materialx`, but the
+     * NODE_SHADER_MATERIALX_BEGIN macro expands its class body inside the
+     * enclosing `node_shader_mix_rgb_cc` namespace — a sibling, not a child,
+     * of `materialx`. Unqualified use here fails name lookup and breaks the
+     * miris/integration build. Qualify it the same way the macro already
+     * qualifies `materialx::NodeParser` / `materialx::NodeItem`. */
+    CLOG_WARN(materialx::LOG_IO_MATERIALX,
               "ShaderNodeMixRGB (Legacy) blend mode %d is not yet supported for MaterialX "
               "export; emitting linear mix as a best-effort approximation",
               node_->custom1);
