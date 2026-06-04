@@ -1299,8 +1299,12 @@ static bNode *find_node_of_type_recursive(bNodeTree *ntree, const blender::Span<
       return node;
     }
     if (node->type_legacy == NODE_GROUP && node->id) {
+      /* Recurse using this function itself; the stale call to find_bsdf_node_in_tree
+       * was a leftover from PR #2 (BL-MAT-NG-001) whose definition was replaced by
+       * find_node_of_type_recursive in PR #18's merge. The orphaned call survived
+       * because PR #2 landed before #18 in the integration consolidation. */
       bNodeTree *group_tree = reinterpret_cast<bNodeTree *>(node->id);
-      if (bNode *found = find_bsdf_node_in_tree(group_tree)) {
+      if (bNode *found = find_node_of_type_recursive(group_tree, node_types)) {
         return found;
       }
     }
